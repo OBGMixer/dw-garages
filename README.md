@@ -26,9 +26,9 @@
 
 ## 📋 Requirements
 
-- QBCore Framework
+- QBOX Framework
 - oxmysql
-- LegacyFuel (or compatible fuel script)
+- Standalone (or compatible fuel script)
 
 ## 🔧 Installation
 
