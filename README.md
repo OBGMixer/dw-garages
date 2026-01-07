@@ -263,5 +263,5 @@ This resource is **FREE** for the community. You may use and modify it as you wi
 - Share improvements with the community
 
 ---
-
-Thank you for purchasing DW-Garages! We hope you enjoy the resource.
+Edited for qbox by OBG!
+Thank you for downloading DW-Garages! We hope you enjoy the resource.
