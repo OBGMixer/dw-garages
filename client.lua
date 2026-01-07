@@ -46,6 +46,12 @@ end)
 RegisterNetEvent('QBCore:Client:OnPlayerLoaded', function()
     PlayerData = QBCore.Functions.GetPlayerData()
     isPlayerLoaded = true
+    
+    -- Wait a bit for player to fully spawn
+    Wait(5000)
+    
+    -- Request server to respawn any vehicles that should be out
+    TriggerServerEvent('dw-garages:server:RespawnPlayerVehicles')
 end)
 
 AddEventHandler('onResourceStart', function(resourceName)
@@ -206,9 +212,18 @@ function ParkJobVehicle(vehicle, jobName)
     
     local plate = QBCore.Functions.GetPlate(vehicle)
     local props = QBCore.Functions.GetVehicleProperties(vehicle)
-    local engineHealth = GetVehicleEngineHealth(vehicle)
-    local bodyHealth = GetVehicleBodyHealth(vehicle)
-    local fuelLevel = exports['LegacyFuel']:GetFuel(vehicle)
+    
+    -- Explicitly capture and save livery to props
+    if DoesEntityExist(vehicle) then
+        local livery = GetVehicleLivery(vehicle)
+        if livery ~= nil and livery >= 0 then
+            props.modLivery = livery
+        end
+    end
+    
+    local engineHealth = GetVehicleEngineHealth(vehicle) or 1000.0
+    local bodyHealth = GetVehicleBodyHealth(vehicle) or 1000.0
+    local fuelLevel = GetVehicleFuelLevel(vehicle)
     
     SetEntityAsMissionEntity(vehicle, true, true)
     
@@ -249,7 +264,7 @@ function ParkJobVehicle(vehicle, jobName)
         SetVehicleEngineOn(vehicle, false, true, true)
         SetVehicleEngineHealth(vehicle, engineHealth)
         SetVehicleBodyHealth(vehicle, bodyHealth)
-        exports['LegacyFuel']:SetFuel(vehicle, fuelLevel)
+        SetVehicleFuelLevel(vehicle, fuelLevel)
         
         TriggerServerEvent('dw-garages:server:TrackJobVehicle', plate, jobName, props)
         
@@ -820,18 +835,30 @@ RegisterNUICallback('takeOutJobVehicle', function(data, cb)
             return
         end
         
-        SetEntityHeading(veh, clearPoint.w)
-        exports['LegacyFuel']:SetFuel(veh, 100)
+        -- Make vehicle persist when player disconnects
+        SetEntityAsMissionEntity(veh, true, true)
+        SetEntityCanBeDamaged(veh, true)
+        SetEntityInvincible(veh, false)
+        SetNetworkIdCanMigrate(NetworkGetNetworkIdFromEntity(veh), false)
         
+        SetEntityHeading(veh, clearPoint.w)
+        SetVehicleFuelLevel(veh, 100)
         FadeInVehicle(veh)
         
         SetVehicleEngineHealth(veh, 1000.0)
         SetVehicleBodyHealth(veh, 1000.0)
         SetVehicleDirtLevel(veh, 0.0) 
         SetVehicleUndriveable(veh, false)
-        SetVehicleEngineOn(veh, true, true, false)
+        SetVehicleEngineOn(veh, false, true, false)
         
         FixEngineSmoke(veh)
+        
+        -- Lock vehicle doors (after all properties are set)
+        Wait(100) -- Additional wait to ensure everything is set
+        SetVehicleDoorsLocked(veh, 2) -- Locked for players
+        SetVehicleDoorsLockedForAllPlayers(veh, false) -- Owner can still unlock
+        Wait(50)
+        SetVehicleDoorsLocked(veh, 2) -- Lock again to ensure it sticks
         
         QBCore.Functions.Notify("Job vehicle taken out", "success")
         cb({status = "success"})
@@ -975,6 +1002,18 @@ Citizen.CreateThread(function()
     
     QBCore.Functions.DeleteVehicle = function(vehicle)
         if DoesEntityExist(vehicle) then
+            local plate = QBCore.Functions.GetPlate(vehicle)
+            -- For player-owned vehicles, don't delete - let them persist when players disconnect
+            if plate then
+                -- Check if it's a player vehicle by checking if it's a mission entity
+                -- Player vehicles are set as mission entities, so they persist
+                if IsEntityAMissionEntity(vehicle) then
+                    -- Player vehicle - don't delete, don't update state
+                    -- Vehicle stays in world and LostVehicleTimeout will handle cleanup
+                    return -- Don't delete, don't call original
+                end
+            end
+            -- Not a player vehicle or no plate - safe to delete normally
             local netId = NetworkGetNetworkIdFromEntity(vehicle)
             TriggerServerEvent('QBCore:Server:DeleteVehicle', netId)
             return originalDeleteVehicle(vehicle)
@@ -985,23 +1024,36 @@ end)
 Citizen.CreateThread(function()
     local trackedVehicles = {}
     while true do
-        Wait(1000) 
+        Wait(10000) -- Check every 10 seconds instead of 1 second
         local vehicles = GetGamePool('CVehicle')
         local currentVehicles = {}
         for _, vehicle in pairs(vehicles) do
             if DoesEntityExist(vehicle) then
                 local plate = QBCore.Functions.GetPlate(vehicle)
                 if plate then
-                    currentVehicles[plate] = true
+                    -- Only track player vehicles (mission entities)
+                    if IsEntityAMissionEntity(vehicle) then
+                        currentVehicles[plate] = true
+                        
+                        -- Save vehicle position and update last_update periodically for LostVehicleTimeout
+                        local coords = GetEntityCoords(vehicle)
+                        local heading = GetEntityHeading(vehicle)
+                        local fuel = GetVehicleFuelLevel(vehicle)
+                        local vehicleData = {
+                            x = coords.x,
+                            y = coords.y,
+                            z = coords.z,
+                            heading = heading,
+                            fuel = fuel
+                        }
+                        TriggerServerEvent('dw-garages:server:SaveVehiclePosition', plate, vehicleData)
+                        TriggerServerEvent('dw-garages:server:UpdateVehicleState', plate, 0)
+                    end
                 end
             end
         end
-        for plate, _ in pairs(trackedVehicles) do
-            if not currentVehicles[plate] then
-                TriggerServerEvent('dw-garages:server:HandleDeletedVehicle', plate)
-                trackedVehicles[plate] = nil
-            end
-        end
+        -- Don't mark vehicles as deleted when they disappear - let them persist
+        -- LostVehicleTimeout will handle moving abandoned vehicles to impound
         trackedVehicles = currentVehicles
     end
 end)
@@ -1027,6 +1079,99 @@ RegisterNetEvent('QBCore:Command:DeleteVehicle', function()
             end
         end
     end
+end)
+
+RegisterNetEvent('dw-garages:client:RespawnVehicle', function(vehicleData, lastPosition)
+    if not vehicleData or not lastPosition then return end
+    
+    -- Wait a moment to ensure player is fully loaded
+    Wait(2000)
+    
+    local plate = vehicleData.plate:gsub("%s+", "")
+    local model = vehicleData.vehicle
+    
+    -- Check if vehicle already exists
+    local vehicles = GetGamePool('CVehicle')
+    for _, veh in pairs(vehicles) do
+        if DoesEntityExist(veh) then
+            local vehPlate = QBCore.Functions.GetPlate(veh)
+            if vehPlate and vehPlate:gsub("%s+", "") == plate then
+                -- Vehicle already exists, don't respawn
+                return
+            end
+        end
+    end
+    
+    -- Spawn vehicle at last position
+    local spawnCoords = vector3(lastPosition.x, lastPosition.y, lastPosition.z)
+    QBCore.Functions.SpawnVehicle(model, function(veh)
+        if not veh or veh == 0 then
+            return
+        end
+        
+        -- Make vehicle persist when player disconnects
+        SetEntityAsMissionEntity(veh, true, true)
+        SetEntityCanBeDamaged(veh, true)
+        SetEntityInvincible(veh, false)
+        SetNetworkIdCanMigrate(NetworkGetNetworkIdFromEntity(veh), false)
+        
+        SetEntityCoords(veh, lastPosition.x, lastPosition.y, lastPosition.z)
+        SetEntityHeading(veh, lastPosition.heading or 0.0)
+        SetVehicleNumberPlateText(veh, plate)
+        
+        -- Apply vehicle properties if available
+        if vehicleData.mods then
+            local props = json.decode(vehicleData.mods) or {}
+            if props then
+                QBCore.Functions.SetVehicleProperties(veh, props)
+                Wait(200)
+                
+                -- Apply livery if it exists
+                if props.modLivery ~= nil then
+                    SetVehicleLivery(veh, props.modLivery)
+                    Wait(50)
+                    SetVehicleLivery(veh, props.modLivery)
+                elseif props.livery ~= nil then
+                    SetVehicleLivery(veh, props.livery)
+                    Wait(50)
+                    SetVehicleLivery(veh, props.livery)
+                end
+            end
+        end
+        
+        -- Set fuel (check lastPosition first for saved fuel, then vehicleData, default to 100)
+        local fuelLevel = 100
+        if lastPosition and lastPosition.fuel then
+            fuelLevel = lastPosition.fuel
+        elseif vehicleData.fuel then
+            fuelLevel = vehicleData.fuel
+        end
+        SetVehicleFuelLevel(veh, fuelLevel)
+        Wait(100)
+        
+        -- Set health
+        if vehicleData.engine then
+            SetVehicleEngineHealth(veh, math.max(200.0, math.min(1000.0, vehicleData.engine * 10)))
+        end
+        if vehicleData.body then
+            SetVehicleBodyHealth(veh, math.max(200.0, math.min(1000.0, vehicleData.body * 10)))
+        end
+        
+        -- Lock doors (do this after all properties are set)
+        Wait(200)
+        SetVehicleDoorsLocked(veh, 2) -- Locked for players
+        SetVehicleDoorsLockedForAllPlayers(veh, false) -- Owner can still unlock
+        Wait(100)
+        SetVehicleDoorsLocked(veh, 2) -- Lock again to ensure it sticks
+        
+        -- Give keys
+        TriggerEvent("vehiclekeys:client:SetOwner", plate)
+        
+        -- Update state
+        TriggerServerEvent('dw-garages:server:UpdateVehicleState', plate, 0)
+        
+        QBCore.Functions.Notify("Your vehicle has been respawned", "success")
+    end, spawnCoords, true)
 end)
 
 RegisterNUICallback('checkVehicleState', function(data, cb)
@@ -1135,7 +1280,20 @@ function FadeOutVehicle(vehicle, callback)
             Wait(stepTime)
         end
         
-        QBCore.Functions.DeleteVehicle(vehicle)
+        -- When storing in garage, allow deletion even if it's a mission entity
+        -- Remove mission entity status temporarily to allow deletion
+        if DoesEntityExist(vehicle) then
+            if IsEntityAMissionEntity(vehicle) then
+                SetEntityAsMissionEntity(vehicle, false, true)
+            end
+            -- Allow network migration temporarily for deletion
+            local netId = NetworkGetNetworkIdFromEntity(vehicle)
+            if netId then
+                SetNetworkIdCanMigrate(netId, true)
+            end
+            -- Delete the vehicle
+            DeleteEntity(vehicle)
+        end
         
         if callback then callback() end
     end)
@@ -1302,7 +1460,7 @@ function FixEngineSmoke(vehicle)
     end
     
     SetVehicleEngineHealth(vehicle, engineHealth)
-    SetVehicleEngineOn(vehicle, true, true, false)
+    SetVehicleEngineOn(vehicle, false, true, false)
     SetVehicleDamage(vehicle, 0.0, 0.0, 0.3, 0.0, 0.0, false)
     
     SetEntityProofs(vehicle, false, true, false, false, false, false, false, false)
@@ -1971,61 +2129,144 @@ RegisterNUICallback('takeOutVehicle', function(data, cb)
         
         local spawnCoords = vector3(clearPoint.x, clearPoint.y, clearPoint.z)
         
-        QBCore.Functions.SpawnVehicle(model, function(veh)
-            if not veh or veh == 0 then
-                QBCore.Functions.Notify("Failed to spawn vehicle", "error")
-                cb({status = "error", message = "Failed to spawn"})
-                return
-            end
-            
-            SetEntityHeading(veh, clearPoint.w)
-            exports['LegacyFuel']:SetFuel(veh, data.fuel)
-            SetVehicleNumberPlateText(veh, plate)
-            
-            FadeInVehicle(veh)
-            
-            if currentGarage.type == "public" or currentGarage.type == "gang" then
-                QBCore.Functions.TriggerCallback('dw-garages:server:GetVehicleProperties', function(properties)
-                    if properties then
+        if currentGarage.type == "public" or currentGarage.type == "gang" then
+            QBCore.Functions.TriggerCallback('dw-garages:server:GetVehicleProperties', function(properties)
+                if properties then
+                    QBCore.Functions.SpawnVehicle(model, function(veh)
+                        if not veh or veh == 0 then
+                            QBCore.Functions.Notify("Failed to spawn vehicle", "error")
+                            cb({status = "error", message = "Failed to spawn"})
+                            return
+                        end
+                        
+                        -- Make vehicle persist when player disconnects
+                        SetEntityAsMissionEntity(veh, true, true)
+                        SetEntityCanBeDamaged(veh, true)
+                        SetEntityInvincible(veh, false)
+                        SetNetworkIdCanMigrate(NetworkGetNetworkIdFromEntity(veh), false)
+                        
+                        SetEntityHeading(veh, clearPoint.w)
+                        SetVehicleFuelLevel(veh, data.fuel)
+                        SetVehicleNumberPlateText(veh, plate)
+                        
+                        FadeInVehicle(veh)
+                        
+                        -- Apply vehicle properties including livery
                         QBCore.Functions.SetVehicleProperties(veh, properties)
+                        Wait(200) -- Wait to ensure properties are applied
                         
-                        local engineHealth = math.max(data.engine * 10, 900.0)
-                        local bodyHealth = math.max(data.body * 10, 900.0)
+                        -- Explicitly apply livery if it exists in properties (check multiple possible property names)
+                        if properties.modLivery ~= nil then
+                            SetVehicleLivery(veh, properties.modLivery)
+                            Wait(50)
+                            SetVehicleLivery(veh, properties.modLivery) -- Apply twice to ensure it sticks
+                        elseif properties.livery ~= nil then
+                            SetVehicleLivery(veh, properties.livery)
+                            Wait(50)
+                            SetVehicleLivery(veh, properties.livery) -- Apply twice to ensure it sticks
+                        end
                         
-                        SetVehicleEngineHealth(veh, engineHealth)
-                        SetVehicleBodyHealth(veh, bodyHealth)
-                        SetVehicleDirtLevel(veh, 0.0)
+                        local engineHealth = properties.engineHealth or 1000.0
+                        local bodyHealth = properties.bodyHealth or 1000.0
+                        
+                       SetVehicleEngineHealth(veh, engineHealth + 0.0)
+                       SetVehicleBodyHealth(veh, bodyHealth + 0.0)
+                       SetVehicleDirtLevel(veh, 0.0)
                         
                         FixEngineSmoke(veh)
                         
                         SetVehicleUndriveable(veh, false)
-                        SetVehicleEngineOn(veh, true, true, false)
+                        SetVehicleEngineOn(veh, false, true, false)
+                        
+                        -- Lock vehicle doors (after all properties are set)
+                        Wait(100) -- Additional wait to ensure everything is set
+                        SetVehicleDoorsLocked(veh, 2) -- Locked for players
+                        SetVehicleDoorsLockedForAllPlayers(veh, false) -- Owner can still unlock
+                        Wait(50)
+                        SetVehicleDoorsLocked(veh, 2) -- Lock again to ensure it sticks
                         
                         TriggerServerEvent('dw-garages:server:UpdateVehicleState', plate, 0)
                         
                         if currentGarage.type == "gang" and data.storedInGang then
                             TriggerServerEvent('dw-garages:server:UpdateGangVehicleState', plate, 0)
                         end
+
+                        TriggerEvent("vehiclekeys:client:SetOwner", plate)
+                        
+                        -- Keep vehicle in world - don't let framework delete on disconnect
+                        SetNetworkIdCanMigrate(NetworkGetNetworkIdFromEntity(veh), false)
                         
                         QBCore.Functions.Notify("Vehicle taken out", "success")
                         cb({status = "success"})
-                    else
-                        cb({status = "error", message = "Failed to load properties"})
+                    end, spawnCoords, true)
+                else
+                    cb({status = "error", message = "Failed to load properties"})
+                end
+            end, plate)
+        else 
+            QBCore.Functions.SpawnVehicle(model, function(veh)
+                if not veh or veh == 0 then
+                    QBCore.Functions.Notify("Failed to spawn vehicle", "error")
+                    cb({status = "error", message = "Failed to spawn"})
+                    return
+                end
+                
+                -- Make vehicle persist when player disconnects
+                SetEntityAsMissionEntity(veh, true, true)
+                SetEntityCanBeDamaged(veh, true)
+                SetEntityInvincible(veh, false)
+                SetNetworkIdCanMigrate(NetworkGetNetworkIdFromEntity(veh), false)
+                
+                SetEntityHeading(veh, clearPoint.w)
+                SetVehicleFuelLevel(veh, data.fuel)
+                SetVehicleNumberPlateText(veh, plate)
+                FadeInVehicle(veh)
+                
+                -- Try to get properties for job vehicles that might have livery
+                QBCore.Functions.TriggerCallback('dw-garages:server:GetVehicleProperties', function(properties)
+                    if properties then
+                        -- Apply vehicle properties including livery
+                        QBCore.Functions.SetVehicleProperties(veh, properties)
+                        Wait(200) -- Wait to ensure properties are applied
+                        
+                        -- Explicitly apply livery if it exists in properties (check multiple possible property names)
+                        if properties.modLivery ~= nil then
+                            SetVehicleLivery(veh, properties.modLivery)
+                            Wait(50)
+                            SetVehicleLivery(veh, properties.modLivery) -- Apply twice to ensure it sticks
+                        elseif properties.livery ~= nil then
+                            SetVehicleLivery(veh, properties.livery)
+                            Wait(50)
+                            SetVehicleLivery(veh, properties.livery) -- Apply twice to ensure it sticks
+                        end
                     end
+                    
+                    -- Lock vehicle doors (after properties are applied)
+                    Wait(100) -- Additional wait to ensure everything is set
+                    SetVehicleDoorsLocked(veh, 2) -- Locked for players
+                    SetVehicleDoorsLockedForAllPlayers(veh, false) -- Owner can still unlock
+                    Wait(50)
+                    SetVehicleDoorsLocked(veh, 2) -- Lock again to ensure it sticks
+                    
+                    SetVehicleEngineHealth(veh, 1000.0)
+                    SetVehicleBodyHealth(veh, 1000.0)
+                    SetVehicleDirtLevel(veh, 0.0)
+                    SetVehicleUndriveable(veh, false)
+                    SetVehicleEngineOn(veh, false, true, false)
+                    
+        FixEngineSmoke(veh)
+        
+        -- Update vehicle state for LostVehicleTimeout tracking
+        local plate = QBCore.Functions.GetPlate(veh)
+        if plate then
+            TriggerServerEvent('dw-garages:server:UpdateVehicleState', plate, 0)
+        end
+        
+        QBCore.Functions.Notify("Job vehicle taken out", "success")
+        cb({status = "success"})
                 end, plate)
-            else 
-                SetVehicleEngineHealth(veh, 1000.0)
-                SetVehicleBodyHealth(veh, 1000.0)
-                SetVehicleDirtLevel(veh, 0.0)
-                SetVehicleUndriveable(veh, false)
-                SetVehicleEngineOn(veh, true, true, false)
-                
-                FixEngineSmoke(veh)
-                
-                QBCore.Functions.Notify("Job vehicle taken out", "success")
-                cb({status = "success"})
-            end
-        end, spawnCoords, true)
+            end, spawnCoords, true)
+        end
     end, plate)
 end)
 
@@ -2071,15 +2312,34 @@ RegisterNetEvent('dw-garages:client:TakeOutSharedVehicle', function(plate, vehic
             return
         end
         
+        -- Make vehicle persist when player disconnects
+        SetEntityAsMissionEntity(veh, true, true)
+        SetEntityCanBeDamaged(veh, true)
+        SetEntityInvincible(veh, false)
+        SetNetworkIdCanMigrate(NetworkGetNetworkIdFromEntity(veh), false)
+        
         SetEntityHeading(veh, clearPoint.w)
-        exports['LegacyFuel']:SetFuel(veh, vehicleData.fuel)
+        SetVehicleFuelLevel(veh, vehicleData.fuel)
         SetVehicleNumberPlateText(veh, plate)
         
         FadeInVehicle(veh)
         
         QBCore.Functions.TriggerCallback('dw-garages:server:GetVehicleProperties', function(properties)
             if properties then
+                -- Apply vehicle properties including livery
                 QBCore.Functions.SetVehicleProperties(veh, properties)
+                Wait(200) -- Wait to ensure properties are applied
+                
+                -- Explicitly apply livery if it exists in properties (check multiple possible property names)
+                if properties.modLivery ~= nil then
+                    SetVehicleLivery(veh, properties.modLivery)
+                    Wait(50)
+                    SetVehicleLivery(veh, properties.modLivery) -- Apply twice to ensure it sticks
+                elseif properties.livery ~= nil then
+                    SetVehicleLivery(veh, properties.livery)
+                    Wait(50)
+                    SetVehicleLivery(veh, properties.livery) -- Apply twice to ensure it sticks
+                end
                 
                 local engineHealth = math.max(vehicleData.engine, 900.0)
                 local bodyHealth = math.max(vehicleData.body, 900.0)
@@ -2091,7 +2351,19 @@ RegisterNetEvent('dw-garages:client:TakeOutSharedVehicle', function(plate, vehic
                 FixEngineSmoke(veh)
                 
                 SetVehicleUndriveable(veh, false)
-                SetVehicleEngineOn(veh, true, true, false)
+                SetVehicleEngineOn(veh, false, true, false)
+                
+                -- Update vehicle state for LostVehicleTimeout tracking
+                if plate then
+                    TriggerServerEvent('dw-garages:server:UpdateVehicleState', plate, 0)
+                end
+                
+                -- Lock vehicle doors (after all properties are set)
+                Wait(100) -- Additional wait to ensure everything is set
+                SetVehicleDoorsLocked(veh, 2) -- Locked for players
+                SetVehicleDoorsLockedForAllPlayers(veh, false) -- Owner can still unlock
+                Wait(50)
+                SetVehicleDoorsLocked(veh, 2) -- Lock again to ensure it sticks
                 
                 QBCore.Functions.Notify("Vehicle taken out from shared garage", "success")
             else
@@ -2158,7 +2430,7 @@ function PlayVehicleTransferAnimation(plate, fromGarageId, toGarageId)
         
         SetEntityAsMissionEntity(truck, true, true)
         SetEntityHeading(truck, spawnPos.w)
-        SetVehicleEngineOn(truck, true, true, false)
+        SetVehicleEngineOn(truck, false, true, false)
         
         local driver = CreatePedInsideVehicle(truck, 26, GetHashKey(driverModel), -1, true, false)
         
@@ -2217,128 +2489,128 @@ function PlayVehicleTransferAnimation(plate, fromGarageId, toGarageId)
         local arrived = false
         
         CreateThread(function()
-            while not arrived do
-                Wait(1000) 
+        while not arrived do
+            Wait(1000) 
+            
+            if not DoesEntityExist(truck) or not DoesEntityExist(driver) then
+                break
+            end
+            
+            local curPos = GetEntityCoords(truck)
+            local distToDestination = #(curPos - vector3(arrivalPos.x, arrivalPos.y, arrivalPos.z))
+            
+            if distToDestination < arrivalRange then
+                local curSpeed = GetEntitySpeed(truck) * 3.6 
                 
-                if not DoesEntityExist(truck) or not DoesEntityExist(driver) then
-                    break
-                end
-                
-                local curPos = GetEntityCoords(truck)
-                local distToDestination = #(curPos - vector3(arrivalPos.x, arrivalPos.y, arrivalPos.z))
-                
-                if distToDestination < arrivalRange then
-                    local curSpeed = GetEntitySpeed(truck) * 3.6 
-                    
-                    if curSpeed < 1.0 or distToDestination < 5.0 then
-                        TaskVehicleTempAction(driver, truck, 27, 10000)
-                        arrived = true
-                        break
-                    end
-                end
-                
-                local distMoved = #(curPos - lastPos)
-                local vehicleSpeed = GetEntitySpeed(truck)
-                
-                if distMoved < 0.3 and vehicleSpeed < 0.5 then
-                    stuckCounter = stuckCounter + 1
-                    
-                    if stuckCounter >= 10 then
-                        arrived = true
-                        break
-                    end
-                    if stuckCounter % 3 == 0 then 
-                        ClearPedTasks(driver)
-                        Wait(500)
-                        TaskVehicleDriveToCoord(driver, truck, 
-                            arrivalPos.x, arrivalPos.y, arrivalPos.z, 
-                            speed, 0, GetHashKey(truckModel), 
-                            vehicleFlags, 
-                            arrivalRange, true
-                        )
-                    end
-                else
-                    stuckCounter = 0
-                end
-                
-                if GetGameTimer() - startTime > maxDriveTime then
+                if curSpeed < 1.0 or distToDestination < 5.0 then
+                    TaskVehicleTempAction(driver, truck, 27, 10000)
                     arrived = true
                     break
                 end
-                
-                lastPos = curPos
             end
             
-            if DoesEntityExist(truck) and DoesEntityExist(driver) then
-                ClearPedTasks(driver)
-                TaskVehicleTempAction(driver, truck, 27, 10000) 
-                SetVehicleIndicatorLights(truck, 0, true)
-                SetVehicleIndicatorLights(truck, 1, true)
-                QBCore.Functions.Notify("Loading your vehicle onto the transfer truck...", "primary", 4000)
-                PlaySoundFromEntity(-1, "VEHICLES_TRAILER_ATTACH", truck, 0, 0, 0)
-                Wait(5000)
-                TriggerServerEvent('dw-garages:server:TransferVehicleToGarage', plate, toGarageId, Config.TransferCost or 500)
-                QBCore.Functions.Notify("Vehicle transferred successfully!", "success")
-                SetVehicleIndicatorLights(truck, 0, false)
-                SetVehicleIndicatorLights(truck, 1, false)
-                local driveToExit = false
-                local exitX, exitY, exitZ, exitHeading
-                if exitPos then
-                    driveToExit = true
-                    exitX = exitPos.x
-                    exitY = exitPos.y
-                    exitZ = exitPos.z
-                    exitHeading = exitPos.w
-                else
-                    local curPos = GetEntityCoords(truck)
-                    local curHeading = GetEntityHeading(truck)
-                    local leaveHeading = (curHeading + 180.0) % 360.0
-                    local leaveDistance = 100.0
-                    local success, nodePos, nodeHeading = GetClosestVehicleNodeWithHeading(
-                        curPos.x + math.sin(math.rad(leaveHeading)) * 20.0,
-                        curPos.y + math.cos(math.rad(leaveHeading)) * 20.0,
-                        curPos.z,
-                        0, 3.0, 0
+            local distMoved = #(curPos - lastPos)
+            local vehicleSpeed = GetEntitySpeed(truck)
+            
+            if distMoved < 0.3 and vehicleSpeed < 0.5 then
+                stuckCounter = stuckCounter + 1
+                
+                if stuckCounter >= 10 then
+                    arrived = true
+                    break
+                end
+                if stuckCounter % 3 == 0 then 
+                    ClearPedTasks(driver)
+                    Wait(500)
+                    TaskVehicleDriveToCoord(driver, truck, 
+                        arrivalPos.x, arrivalPos.y, arrivalPos.z, 
+                        speed, 0, GetHashKey(truckModel), 
+                        vehicleFlags, 
+                        arrivalRange, true
                     )
-                    
-                    if success then
-                        driveToExit = true
-                        exitX = nodePos.x
-                        exitY = nodePos.y
-                        exitZ = nodePos.z
-                        exitHeading = nodeHeading
-                    else
-                        driveToExit = true
-                        exitX = curPos.x + math.sin(math.rad(leaveHeading)) * leaveDistance
-                        exitY = curPos.y + math.cos(math.rad(leaveHeading)) * leaveDistance
-                        exitZ = curPos.z
-                        exitHeading = leaveHeading
-                    end
                 end
-                
-                if driveToExit then
-                    TaskVehicleDriveToCoord(driver, truck, exitX, exitY, exitZ, speed, 0, GetHashKey(truckModel), vehicleFlags, 2.0, true)
-                    
-                    Wait(5000)
-                    
-                    for i = 255, 0, -5 do
-                        if DoesEntityExist(truck) then
-                            SetEntityAlpha(truck, i, false)
-                        end
-                        
-                        if DoesEntityExist(driver) then
-                            SetEntityAlpha(driver, i, false)
-                        end
-                        
-                        Wait(50) 
-                    end
-                end
-                
-                RemoveBlip(blip)
-                DeleteEntity(driver)
-                DeleteEntity(truck)
+            else
+                stuckCounter = 0
             end
-        end)
+            
+            if GetGameTimer() - startTime > maxDriveTime then
+                arrived = true
+                break
+            end
+            
+            lastPos = curPos
+        end
+        
+        if DoesEntityExist(truck) and DoesEntityExist(driver) then
+            ClearPedTasks(driver)
+            TaskVehicleTempAction(driver, truck, 27, 10000) 
+            SetVehicleIndicatorLights(truck, 0, true)
+            SetVehicleIndicatorLights(truck, 1, true)
+            QBCore.Functions.Notify("Loading your vehicle onto the transfer truck...", "primary", 4000)
+            PlaySoundFromEntity(-1, "VEHICLES_TRAILER_ATTACH", truck, 0, 0, 0)
+            Wait(5000)
+            TriggerServerEvent('dw-garages:server:TransferVehicleToGarage', plate, toGarageId, Config.TransferCost or 500)
+            QBCore.Functions.Notify("Vehicle transferred successfully!", "success")
+            SetVehicleIndicatorLights(truck, 0, false)
+            SetVehicleIndicatorLights(truck, 1, false)
+            local driveToExit = false
+            local exitX, exitY, exitZ, exitHeading
+            if exitPos then
+                driveToExit = true
+                exitX = exitPos.x
+                exitY = exitPos.y
+                exitZ = exitPos.z
+                exitHeading = exitPos.w
+            else
+                local curPos = GetEntityCoords(truck)
+                local curHeading = GetEntityHeading(truck)
+                local leaveHeading = (curHeading + 180.0) % 360.0
+                local leaveDistance = 100.0
+                local success, nodePos, nodeHeading = GetClosestVehicleNodeWithHeading(
+                    curPos.x + math.sin(math.rad(leaveHeading)) * 20.0,
+                    curPos.y + math.cos(math.rad(leaveHeading)) * 20.0,
+                    curPos.z,
+                    0, 3.0, 0
+                )
+                
+                if success then
+                    driveToExit = true
+                    exitX = nodePos.x
+                    exitY = nodePos.y
+                    exitZ = nodePos.z
+                    exitHeading = nodeHeading
+                else
+                    driveToExit = true
+                    exitX = curPos.x + math.sin(math.rad(leaveHeading)) * leaveDistance
+                    exitY = curPos.y + math.cos(math.rad(leaveHeading)) * leaveDistance
+                    exitZ = curPos.z
+                    exitHeading = leaveHeading
+                end
+            end
+            
+            if driveToExit then
+                TaskVehicleDriveToCoord(driver, truck, exitX, exitY, exitZ, speed, 0, GetHashKey(truckModel), vehicleFlags, 2.0, true)
+                
+                Wait(5000)
+                
+                for i = 255, 0, -5 do
+                    if DoesEntityExist(truck) then
+                        SetEntityAlpha(truck, i, false)
+                    end
+                    
+                    if DoesEntityExist(driver) then
+                        SetEntityAlpha(driver, i, false)
+                    end
+                    
+                    Wait(50) 
+                end
+            end
+            
+            RemoveBlip(blip)
+            DeleteEntity(driver)
+            DeleteEntity(truck)
+        end
+    end)
     end, vector3(spawnPos.x, spawnPos.y, spawnPos.z), true)
 end
 
@@ -2720,12 +2992,22 @@ RegisterNetEvent('dw-garages:client:StoreVehicle', function(data)
     
     local plate = QBCore.Functions.GetPlate(curVeh)
     local props = QBCore.Functions.GetVehicleProperties(curVeh)
-    local fuel = exports['LegacyFuel']:GetFuel(curVeh)
+    
+    -- Explicitly capture and save livery to props
+    if DoesEntityExist(curVeh) then
+        local livery = GetVehicleLivery(curVeh)
+        if livery ~= nil and livery >= 0 then
+            props.modLivery = livery
+        end
+    end
+    
+    local fuel = GetVehicleFuelLevel(curVeh)
     local engineHealth = GetVehicleEngineHealth(curVeh)
     local bodyHealth = GetVehicleBodyHealth(curVeh)
     
     QBCore.Functions.TriggerCallback('dw-garages:server:CheckOwnership', function(isOwner, isInGarage)
-        if isOwner or (garageType == "gang" and isInGarage) then
+        -- Allow storage if player owns the vehicle, or has access to shared garage, or has gang access
+        if isOwner or isInGarage or (garageType == "gang" and isInGarage) then
             FadeOutVehicle(curVeh, function()
                 TriggerServerEvent('dw-garages:server:StoreVehicle', plate, garageId, props, fuel, engineHealth, bodyHealth, garageType)
                 QBCore.Functions.Notify("Vehicle stored in garage", "success")
@@ -2742,7 +3024,7 @@ RegisterNetEvent('dw-garages:client:StoreVehicle', function(data)
                 end
             end)
         else
-            QBCore.Functions.Notify("You don't own this vehicle", "error")
+            QBCore.Functions.Notify("You don't have permission to store this vehicle", "error")
         end
     end, plate, garageType)
 end)
@@ -3245,6 +3527,15 @@ end
 function StoreVehicleInGarage(vehicle, garageId, garageType)
     local plate = QBCore.Functions.GetPlate(vehicle)
     local props = QBCore.Functions.GetVehicleProperties(vehicle)
+    
+    -- Explicitly capture and save livery to props
+    if DoesEntityExist(vehicle) then
+        local livery = GetVehicleLivery(vehicle)
+        if livery ~= nil and livery >= 0 then
+            props.modLivery = livery
+        end
+    end
+    
     local fuel = 0
     
     if GetResourceState('LegacyFuel') ~= 'missing' then
@@ -3260,10 +3551,18 @@ function StoreVehicleInGarage(vehicle, garageId, garageType)
     local engineHealth = GetVehicleEngineHealth(vehicle)
     local bodyHealth = GetVehicleBodyHealth(vehicle)
     
-    FadeOutVehicle(vehicle, function()
-        TriggerServerEvent('dw-garages:server:StoreVehicle', plate, garageId, props, fuel, engineHealth, bodyHealth, garageType)
-        QBCore.Functions.Notify("Vehicle stored in garage", "success")
-    end)
+    -- Check ownership/access before storing
+    QBCore.Functions.TriggerCallback('dw-garages:server:CheckOwnership', function(isOwner, isInGarage)
+        -- Allow storage if player owns the vehicle, or has access to shared garage, or has gang access
+        if isOwner or isInGarage or (garageType == "gang" and isInGarage) then
+            FadeOutVehicle(vehicle, function()
+                TriggerServerEvent('dw-garages:server:StoreVehicle', plate, garageId, props, fuel, engineHealth, bodyHealth, garageType)
+                QBCore.Functions.Notify("Vehicle stored in garage", "success")
+            end)
+        else
+            QBCore.Functions.Notify("You don't have permission to store this vehicle", "error")
+        end
+    end, plate, garageType)
 end
 
 CreateThread(function()
@@ -3354,19 +3653,27 @@ RegisterCommand('impound', function(source, args)
     
     local props = QBCore.Functions.GetVehicleProperties(vehicle)
     
-    local dialog = exports['qb-input']:ShowInput({
-        header = "Impound Vehicle",
-        submitText = "Submit",
-        inputs = {
-            {
-                text = "Reason for impound",
-                name = "reason", 
-                type = "text"
-            }
+    -- Explicitly capture and save livery to props
+    if DoesEntityExist(vehicle) then
+        local livery = GetVehicleLivery(vehicle)
+        if livery ~= nil and livery >= 0 then
+            props.modLivery = livery
+        end
+    end
+    
+    local dialog = lib.inputDialog("Impound Vehicle", {
+        {
+            type = 'input',
+            label = "Reason for impound",
+            description = 'Enter the reason for impounding this vehicle',
+            required = true,
+            min = 3,
+            max = 255,
         }
     })
     
-    if dialog and dialog.reason then
+    if dialog and dialog[1] and dialog[1] ~= "" then
+        local reason = dialog[1]
         local impoundType = "police"
         
         TaskStartScenarioInPlace(ped, "PROP_HUMAN_CLIPBOARD", 0, true)
@@ -3378,11 +3685,18 @@ RegisterCommand('impound', function(source, args)
         }, {}, {}, {}, function() 
             ClearPedTasks(ped)
             
-            TriggerServerEvent('dw-garages:server:ImpoundVehicleWithParams', plate, props, dialog.reason, impoundType, 
+            TriggerServerEvent('dw-garages:server:ImpoundVehicleWithParams', plate, props, reason, impoundType, 
                 PlayerData.job.name, PlayerData.charinfo.firstname .. " " .. PlayerData.charinfo.lastname, impoundFine)
             
+            -- Remove mission entity status before deleting
+            if DoesEntityExist(vehicle) and IsEntityAMissionEntity(vehicle) then
+                SetEntityAsMissionEntity(vehicle, false, true)
+            end
+            local netId = NetworkGetNetworkIdFromEntity(vehicle)
+            if netId then
+                SetNetworkIdCanMigrate(netId, true)
+            end
             FadeOutVehicle(vehicle, function()
-                DeleteVehicle(vehicle)
                 QBCore.Functions.Notify("Vehicle impounded with $" .. impoundFine .. " fine", "success")
             end)
         end, function() 
@@ -3463,6 +3777,9 @@ RegisterNUICallback('releaseImpoundedVehicle', function(data, cb)
         return
     end
     
+    -- Clean the plate (remove spaces)
+    plate = plate:gsub("%s+", "")
+    
     QBCore.Functions.TriggerCallback('dw-garages:server:CanPayImpoundFee', function(canPay)
         if canPay then
             local impoundInfo = Config.ImpoundLots[impoundId]
@@ -3476,21 +3793,68 @@ RegisterNUICallback('releaseImpoundedVehicle', function(data, cb)
             
             QBCore.Functions.TriggerCallback('dw-garages:server:GetVehicleByPlate', function(vehData)
                 if vehData then
-                    QBCore.Functions.SpawnVehicle(vehData.vehicle, function(veh)
-                        SetEntityHeading(veh, spawnPoint.w)
-                        SetEntityCoords(veh, spawnPoint.x, spawnPoint.y, spawnPoint.z)
-                        
-                        exports['LegacyFuel']:SetFuel(veh, vehData.fuel or 100)
-                        SetVehicleNumberPlateText(veh, plate)
-                        
-                        FadeInVehicle(veh)
-                        
-                        QBCore.Functions.TriggerCallback('dw-garages:server:GetVehicleProperties', function(properties)
-                            if properties then
-                                QBCore.Functions.SetVehicleProperties(veh, properties)
+                    QBCore.Functions.TriggerCallback('dw-garages:server:GetVehicleProperties', function(properties)
+                        if properties then
+                            local spawnCoords = vector3(spawnPoint.x, spawnPoint.y, spawnPoint.z)
+                            QBCore.Functions.SpawnVehicle(vehData.vehicle, function(veh)
+                                if not veh or veh == 0 then
+                                    QBCore.Functions.Notify("Failed to spawn vehicle", "error")
+                                    cb({status = "error", message = "Failed to spawn"})
+                                    return
+                                end
                                 
-                                local engineHealth = math.max(vehData.engine * 10, 200.0)
-                                local bodyHealth = math.max(vehData.body * 10, 200.0)
+                                -- Make vehicle persist when player disconnects
+                                SetEntityAsMissionEntity(veh, true, true)
+                                SetEntityCanBeDamaged(veh, true)
+                                SetEntityInvincible(veh, false)
+                                SetNetworkIdCanMigrate(NetworkGetNetworkIdFromEntity(veh), false)
+                                
+                                SetEntityHeading(veh, spawnPoint.w)
+                                SetEntityCoords(veh, spawnPoint.x, spawnPoint.y, spawnPoint.z)
+                                SetVehicleFuelLevel(veh, vehData.fuel or 100)
+                                SetVehicleNumberPlateText(veh, plate)
+                                
+                                FadeInVehicle(veh)
+                                
+                                -- Apply vehicle properties including livery
+                                QBCore.Functions.SetVehicleProperties(veh, properties)
+                                Wait(200) -- Wait to ensure properties are applied
+                                
+                                -- Explicitly apply livery if it exists in properties (check multiple possible property names)
+                                if properties.modLivery ~= nil then
+                                    SetVehicleLivery(veh, properties.modLivery)
+                                    Wait(50)
+                                    SetVehicleLivery(veh, properties.modLivery) -- Apply twice to ensure it sticks
+                                elseif properties.livery ~= nil then
+                                    SetVehicleLivery(veh, properties.livery)
+                                    Wait(50)
+                                    SetVehicleLivery(veh, properties.livery) -- Apply twice to ensure it sticks
+                                end
+                                
+                                -- Get engine and body health - check properties first, then database values
+                                local engineHealth = 1000.0
+                                local bodyHealth = 1000.0
+                                
+                                -- Check if properties have health values stored (in 0-1000 format)
+                                if properties.engineHealth ~= nil then
+                                    engineHealth = math.max(tonumber(properties.engineHealth) or 1000.0, 200.0)
+                                elseif vehData.engine ~= nil then
+                                    -- Database stores as 0-100, convert to 0-1000
+                                    local dbEngine = tonumber(vehData.engine) or 100
+                                    engineHealth = math.max(dbEngine * 10.0, 200.0)
+                                end
+                                
+                                if properties.bodyHealth ~= nil then
+                                    bodyHealth = math.max(tonumber(properties.bodyHealth) or 1000.0, 200.0)
+                                elseif vehData.body ~= nil then
+                                    -- Database stores as 0-100, convert to 0-1000
+                                    local dbBody = tonumber(vehData.body) or 100
+                                    bodyHealth = math.max(dbBody * 10.0, 200.0)
+                                end
+                                
+                                -- Ensure values are within valid range (200-1000)
+                                engineHealth = math.max(200.0, math.min(1000.0, engineHealth))
+                                bodyHealth = math.max(200.0, math.min(1000.0, bodyHealth))
                                 
                                 SetVehicleEngineHealth(veh, engineHealth)
                                 SetVehicleBodyHealth(veh, bodyHealth)
@@ -3498,19 +3862,35 @@ RegisterNUICallback('releaseImpoundedVehicle', function(data, cb)
                                 
                                 FixEngineSmoke(veh)
                                 
+                                SetVehicleDoorsLocked(veh, 2)
+
                                 SetVehicleUndriveable(veh, false)
-                                SetVehicleEngineOn(veh, true, true, false)
+                                SetVehicleEngineOn(veh, false, true, false)
+                                
+                                -- Update vehicle state for LostVehicleTimeout tracking
+                                if plate then
+                                    TriggerServerEvent('dw-garages:server:UpdateVehicleState', plate, 0)
+                                end
+                                
+                                -- Lock vehicle doors (after all properties are set)
+                                --Wait(100) -- Additional wait to ensure everything is set
+                                SetVehicleDoorsLocked(veh, 2) -- Locked for players
+                                SetVehicleDoorsLockedForAllPlayers(veh, false) -- Owner can still unlock
+                                --Wait(50)
+                                --SetVehicleDoorsLocked(veh, 2) -- Lock again to ensure it sticks
+
+                                TriggerEvent("vehiclekeys:client:SetOwner", plate)
                                 
                                 TriggerServerEvent('dw-garages:server:PayImpoundFee', plate, fee)
                                 
                                 QBCore.Functions.Notify("Vehicle released from impound", "success")
                                 cb({status = "success"})
-                            else
-                                QBCore.Functions.Notify("Failed to load vehicle properties", "error")
-                                cb({status = "error", message = "Failed to load vehicle"})
-                            end
-                        end, plate)
-                    end, vector3(spawnPoint.x, spawnPoint.y, spawnPoint.z), true)
+                            end, spawnCoords, true)
+                        else
+                            QBCore.Functions.Notify("Failed to load vehicle properties", "error")
+                            cb({status = "error", message = "Failed to load vehicle"})
+                        end
+                    end, plate)
                 else
                     QBCore.Functions.Notify("Vehicle data not found", "error")
                     cb({status = "error", message = "Vehicle not found"})
@@ -3552,31 +3932,47 @@ AddEventHandler('dw-garages:client:ImpoundVehicle', function()
     end
     
     local props = QBCore.Functions.GetVehicleProperties(vehicle)
+    
+    -- Explicitly capture and save livery to props
+    if DoesEntityExist(vehicle) then
+        local livery = GetVehicleLivery(vehicle)
+        if livery ~= nil and livery >= 0 then
+            props.modLivery = livery
+        end
+    end
+    
     local model = GetEntityModel(vehicle)
     local displayName = GetDisplayNameFromVehicleModel(model)
     local impoundType = "police"
     
-    local dialog = exports['qb-input']:ShowInput({
-        header = "Impound Vehicle",
-        submitText = "Submit",
-        inputs = {
-            {
-                text = "Reason for Impound",
-                name = "reason",
-                type = "text",
-                isRequired = true
-            },
-            {
-                text = "Impound Type",
-                name = "type",
-                type = "select",
-                options = Config.ImpounderTypes,
-                default = "police"
-            }
+    -- Convert Config.ImpounderTypes to ox_lib format
+    local impoundOptions = {}
+    for key, value in pairs(Config.ImpounderTypes) do
+        table.insert(impoundOptions, {label = value, value = key})
+    end
+    
+    local dialog = lib.inputDialog("Impound Vehicle", {
+        {
+            type = 'input',
+            label = "Reason for Impound",
+            description = 'Enter the reason for impounding this vehicle',
+            required = true,
+            min = 3,
+            max = 255,
+        },
+        {
+            type = 'select',
+            label = "Impound Type",
+            description = 'Select the type of impound',
+            options = impoundOptions,
+            default = "police",
+            required = true,
         }
     })
     
-    if dialog and dialog.reason then
+    if dialog and dialog[1] and dialog[1] ~= "" and dialog[2] then
+        local reason = dialog[1]
+        local impoundType = dialog[2]
         TaskStartScenarioInPlace(ped, "PROP_HUMAN_CLIPBOARD", 0, true)
         QBCore.Functions.Progressbar("impounding_vehicle", "Impounding Vehicle...", 10000, false, true, {
             disableMovement = true,
@@ -3586,10 +3982,17 @@ AddEventHandler('dw-garages:client:ImpoundVehicle', function()
         }, {}, {}, {}, function() 
             ClearPedTasks(ped)
             
-            TriggerServerEvent('dw-garages:server:ImpoundVehicle', plate, props, dialog.reason, dialog.type, PlayerData.job.name, PlayerData.charinfo.firstname .. " " .. PlayerData.charinfo.lastname)
+            TriggerServerEvent('dw-garages:server:ImpoundVehicle', plate, props, reason, impoundType, PlayerData.job.name, PlayerData.charinfo.firstname .. " " .. PlayerData.charinfo.lastname)
             
+            -- Remove mission entity status before deleting
+            if DoesEntityExist(vehicle) and IsEntityAMissionEntity(vehicle) then
+                SetEntityAsMissionEntity(vehicle, false, true)
+            end
+            local netId = NetworkGetNetworkIdFromEntity(vehicle)
+            if netId then
+                SetNetworkIdCanMigrate(netId, true)
+            end
             FadeOutVehicle(vehicle, function()
-                DeleteVehicle(vehicle)
                 QBCore.Functions.Notify("Vehicle impounded successfully", "success")
             end)
         end, function() 
