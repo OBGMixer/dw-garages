@@ -75,26 +75,57 @@ end)
 
 QBCore.Functions.CreateCallback('dw-garages:server:CheckOwnership', function(source, cb, plate, garageType)
     local Player = QBCore.Functions.GetPlayer(source)
-    if not Player then return cb(false) end
+    if not Player then return cb(false, false) end
     
     local citizenid = Player.PlayerData.citizenid
     local isOwner = false
     local isInGarage = false
     
-    MySQL.Async.fetchAll('SELECT * FROM player_vehicles WHERE plate = ? AND citizenid = ?', {plate, citizenid}, function(result)
+    MySQL.Async.fetchAll('SELECT * FROM player_vehicles WHERE plate = ?', {plate}, function(result)
         if result[1] then
-            isOwner = true
-        end
-        
-        if garageType == "gang" and not isOwner then
-            local gang = Player.PlayerData.gang.name
-            if gang and gang ~= "none" then
-                MySQL.Async.fetchAll('SELECT * FROM gang_vehicles WHERE plate = ? AND gang = ?', {plate, gang}, function(gangResult)
-                    if gangResult[1] then
-                        isInGarage = true
+            -- Check if player owns the vehicle
+            if result[1].citizenid == citizenid then
+                isOwner = true
+            end
+            
+            -- Check if vehicle is in a shared garage the player has access to
+            if result[1].shared_garage_id and not isOwner then
+                local sharedGarageId = result[1].shared_garage_id
+                -- Check if player is a member of this shared garage
+                MySQL.Async.fetchAll('SELECT * FROM shared_garage_members WHERE garage_id = ? AND member_citizenid = ?', 
+                    {sharedGarageId, citizenid}, function(memberResult)
+                        if memberResult and #memberResult > 0 then
+                            isInGarage = true
+                            cb(isOwner, isInGarage)
+                        else
+                            -- Check if player is the owner of the shared garage
+                            MySQL.Async.fetchAll('SELECT * FROM shared_garages WHERE id = ? AND owner_citizenid = ?', 
+                                {sharedGarageId, citizenid}, function(ownerResult)
+                                    if ownerResult and #ownerResult > 0 then
+                                        isInGarage = true
+                                    end
+                                    cb(isOwner, isInGarage)
+                                end
+                            )
+                        end
                     end
+                )
+                return
+            end
+            
+            -- Check gang vehicles
+            if garageType == "gang" and not isOwner then
+                local gang = Player.PlayerData.gang.name
+                if gang and gang ~= "none" then
+                    MySQL.Async.fetchAll('SELECT * FROM gang_vehicles WHERE plate = ? AND gang = ?', {plate, gang}, function(gangResult)
+                        if gangResult[1] then
+                            isInGarage = true
+                        end
+                        cb(isOwner, isInGarage)
+                    end)
+                else
                     cb(isOwner, isInGarage)
-                end)
+                end
             else
                 cb(isOwner, isInGarage)
             end
@@ -329,7 +360,7 @@ function ParkJobVehicle(vehicle, jobName)
     -- Get current vehicle state
     local engineHealth = GetVehicleEngineHealth(vehicle)
     local bodyHealth = GetVehicleBodyHealth(vehicle)
-    local fuelLevel = exports['LegacyFuel']:GetFuel(vehicle)
+    local fuelLevel = GetVehicleFuelLevel(vehicle)
     
     -- Set vehicle as mission entity
     SetEntityAsMissionEntity(vehicle, true, true)
@@ -368,7 +399,7 @@ function ParkJobVehicle(vehicle, jobName)
         SetVehicleEngineOn(vehicle, false, true, true)
         SetVehicleEngineHealth(vehicle, engineHealth)
         SetVehicleBodyHealth(vehicle, bodyHealth)
-        exports['LegacyFuel']:SetFuel(vehicle, fuelLevel)
+        SetVehicleFuelLevel(vehicle, fuelLevel)
         
         -- Store vehicle info
         TriggerServerEvent('dw-garages:server:TrackJobVehicle', plate, jobName, props, engineHealth, bodyHealth, fuelLevel, spotIndex)
@@ -429,7 +460,72 @@ RegisterNetEvent('dw-garages:server:StoreVehicle', function(plate, garageId, pro
     local src = source
     local Player = QBCore.Functions.GetPlayer(src)
     if not Player then return end
-    local citizenid = Player.PlayerData.citizenid    
+    local citizenid = Player.PlayerData.citizenid
+    
+    -- First check if player has permission to store this vehicle
+    MySQL.Async.fetchAll('SELECT * FROM player_vehicles WHERE plate = ?', {plate}, function(vehicleResult)
+        if not vehicleResult or #vehicleResult == 0 then
+            TriggerClientEvent('QBCore:Notify', src, "Vehicle not found", "error")
+            return
+        end
+        
+        local vehicle = vehicleResult[1]
+        local hasPermission = false
+        
+        -- Check if player owns the vehicle
+        if vehicle.citizenid == citizenid then
+            hasPermission = true
+        else
+            -- Check if vehicle is in a shared garage the player has access to
+            if vehicle.shared_garage_id then
+                local sharedGarageId = vehicle.shared_garage_id
+                -- Check if player is a member or owner of this shared garage
+                MySQL.Async.fetchAll('SELECT * FROM shared_garage_members WHERE garage_id = ? AND member_citizenid = ?', 
+                    {sharedGarageId, citizenid}, function(memberResult)
+                        if memberResult and #memberResult > 0 then
+                            hasPermission = true
+                        else
+                            MySQL.Async.fetchAll('SELECT * FROM shared_garages WHERE id = ? AND owner_citizenid = ?', 
+                                {sharedGarageId, citizenid}, function(ownerResult)
+                                    if ownerResult and #ownerResult > 0 then
+                                        hasPermission = true
+                                    end
+                                    
+                                    if not hasPermission then
+                                        TriggerClientEvent('QBCore:Notify', src, "You don't have permission to store this vehicle", "error")
+                                        return
+                                    end
+                                    
+                                    -- Proceed with storage
+                                    storeVehicleInDatabase(src, plate, garageId, props, fuel, engineHealth, bodyHealth, garageType)
+                                end
+                            )
+                            return
+                        end
+                        
+                        if hasPermission then
+                            -- Proceed with storage
+                            storeVehicleInDatabase(src, plate, garageId, props, fuel, engineHealth, bodyHealth, garageType)
+                        end
+                    end
+                )
+                return
+            end
+        end
+        
+        if not hasPermission then
+            TriggerClientEvent('QBCore:Notify', src, "You don't have permission to store this vehicle", "error")
+            return
+        end
+        
+        -- Proceed with storage
+        storeVehicleInDatabase(src, plate, garageId, props, fuel, engineHealth, bodyHealth, garageType)
+    end)
+end)
+
+function storeVehicleInDatabase(src, plate, garageId, props, fuel, engineHealth, bodyHealth, garageType)
+    local Player = QBCore.Functions.GetPlayer(src)
+    if not Player then return end
     
     MySQL.Async.fetchAll('SHOW COLUMNS FROM player_vehicles LIKE "stored"', {}, function(storedColumn)
         local hasStoredColumn = #storedColumn > 0
@@ -449,6 +545,25 @@ RegisterNetEvent('dw-garages:server:StoreVehicle', function(plate, garageId, pro
             table.insert(params, plate)
             
             MySQL.Async.execute(query, params, function(rowsChanged)
+                if rowsChanged > 0 then
+                    OutsideVehicles[plate] = nil
+                    
+                    if garageType == "gang" then
+                        local gang = Player.PlayerData.gang.name
+                        if gang and gang ~= "none" then
+                            MySQL.Async.execute('UPDATE gang_vehicles SET stored = 1 WHERE plate = ? AND gang = ?', {plate, gang})
+                        end
+                    end
+                    
+                    -- Trigger refresh events
+                    TriggerClientEvent('dw-garages:client:RefreshVehicleList', src)
+                else
+                    TriggerClientEvent('QBCore:Notify', src, "Failed to store vehicle", "error")
+                end
+            end)
+        end)
+    end)
+end
                 if rowsChanged > 0 then
                     OutsideVehicles[plate] = nil
                     
@@ -912,6 +1027,59 @@ RegisterNetEvent('dw-garages:server:UpdateVehicleState', function(plate, state)
     )
 end)
 
+RegisterNetEvent('dw-garages:server:SaveVehiclePosition', function(plate, vehicleData)
+    if not plate or not vehicleData then return end
+    
+    plate = plate:gsub("%s+", "")
+    
+    -- Save vehicle position to database (store in mods or a separate column if available)
+    MySQL.Async.fetchAll('SELECT * FROM player_vehicles WHERE plate = ? AND state = 0', {plate}, function(result)
+        if result and #result > 0 then
+            local mods = {}
+            if result[1].mods then
+                mods = json.decode(result[1].mods) or {}
+            end
+            
+            -- Store position in mods object
+            mods.lastPosition = vehicleData
+            
+            MySQL.Async.execute('UPDATE player_vehicles SET mods = ?, last_update = ? WHERE plate = ? AND state = 0', 
+                {json.encode(mods), os.time(), plate}, 
+                function(rowsChanged)
+                    -- Position saved
+                end
+            )
+        end
+    end)
+end)
+
+RegisterNetEvent('dw-garages:server:RespawnPlayerVehicles', function()
+    local src = source
+    local Player = QBCore.Functions.GetPlayer(src)
+    if not Player then return end
+    
+    local citizenid = Player.PlayerData.citizenid
+    
+    -- Get all vehicles that should be out (state = 0) for this player
+    MySQL.Async.fetchAll('SELECT * FROM player_vehicles WHERE citizenid = ? AND state = 0', {citizenid}, function(result)
+        if result and #result > 0 then
+            for _, vehicle in ipairs(result) do
+                -- Check if vehicle has a saved position
+                local mods = {}
+                if vehicle.mods then
+                    mods = json.decode(vehicle.mods) or {}
+                end
+                
+                if mods.lastPosition then
+                    -- Trigger client to respawn vehicle at last position
+                    TriggerClientEvent('dw-garages:client:RespawnVehicle', src, vehicle, mods.lastPosition)
+                    Wait(500) -- Small delay between respawns
+                end
+            end
+        end
+    end)
+end)
+
 RegisterNetEvent('dw-garages:server:RemoveVehicleFromSharedGarage', function(plate)
     local src = source
     local Player = QBCore.Functions.GetPlayer(src)
@@ -1134,12 +1302,17 @@ RegisterNetEvent('dw-garages:server:HandleDeletedVehicle', function(plate)
     
     plate = plate:gsub("%s+", "")
     
-    MySQL.Async.fetchAll('SELECT * FROM player_vehicles WHERE plate = ?', {plate}, function(result)
+    -- Only mark as impounded if vehicle is actually deleted, not just on disconnect
+    -- This allows vehicles to persist when players disconnect
+    MySQL.Async.fetchAll('SELECT * FROM player_vehicles WHERE plate = ? AND state = 0', {plate}, function(result)
         if result and #result > 0 then
-            MySQL.Async.execute('UPDATE player_vehicles SET state = 2, garage = "impound", impoundedtime = ? WHERE plate = ? AND state = 0', 
+            -- Update last_update timestamp but keep vehicle in world (state = 0)
+            -- LostVehicleTimeout will handle moving abandoned vehicles to impound
+            MySQL.Async.execute('UPDATE player_vehicles SET last_update = ? WHERE plate = ? AND state = 0', 
                 {os.time(), plate}, 
                 function(rowsChanged)
                     if rowsChanged > 0 then
+                        -- Vehicle stays in world, just update timestamp
                     end
                 end
             )
@@ -1149,6 +1322,8 @@ end)
 
 RegisterNetEvent('QBCore:Server:DeleteVehicle', function(netId)
     -- This event is triggered from the client when a vehicle is deleted
+    -- Don't move player vehicles to impound on deletion - let them persist
+    -- Only update timestamp for LostVehicleTimeout
     if netId then
         local vehicle = NetworkGetEntityFromNetworkId(netId)
         if DoesEntityExist(vehicle) then
@@ -1156,11 +1331,13 @@ RegisterNetEvent('QBCore:Server:DeleteVehicle', function(netId)
             if plate then
                 plate = plate:gsub("%s+", "") -- Remove spaces
                 
-                -- Update the database to set the vehicle to impound
-                MySQL.Async.execute('UPDATE player_vehicles SET state = 2, garage = "impound", impoundedtime = ? WHERE plate = ? AND state = 0', 
+                -- For player vehicles, just update last_update, don't move to impound
+                -- This allows vehicles to persist when players disconnect
+                MySQL.Async.execute('UPDATE player_vehicles SET last_update = ? WHERE plate = ? AND state = 0', 
                     {os.time(), plate}, 
                     function(rowsChanged)
                         if rowsChanged > 0 then
+                            -- Vehicle stays in world, LostVehicleTimeout will handle cleanup
                         end
                     end
                 )
@@ -1199,7 +1376,7 @@ RegisterNetEvent('QBCore:Server:OnVehicleDelete', function(plate)
 end)
 
 
-RegisterNetEvent('vehiclemod:server:syncDeletion', function(netId, plate)
+--[[RegisterNetEvent('vehiclemod:server:syncDeletion', function(netId, plate)
     if plate then
         -- Clean the plate (remove spaces)
         plate = plate:gsub("%s+", "")
@@ -1226,7 +1403,7 @@ RegisterNetEvent('vehiclemod:server:syncDeletion', function(netId, plate)
             end
         end)
     end
-end)
+end)]]--
 
 RegisterNetEvent('qb-garage:server:UpdateOutsideVehicles', function(plate, state)
     if plate and state == 2 then
@@ -1452,17 +1629,58 @@ QBCore.Functions.CreateCallback('dw-garages:server:CheckIfVehicleOwned', functio
     
     local citizenid = Player.PlayerData.citizenid
     
-    MySQL.Async.fetchAll('SELECT * FROM player_vehicles WHERE plate = ? AND citizenid = ?', {plate, citizenid}, function(result)
+    MySQL.Async.fetchAll('SELECT * FROM player_vehicles WHERE plate = ?', {plate}, function(result)
         if result and #result > 0 then
-            cb(true)
-        else
-            if Player.PlayerData.gang and Player.PlayerData.gang.name ~= "none" then
-                MySQL.Async.fetchAll('SELECT * FROM gang_vehicles WHERE plate = ? AND gang = ?', {plate, Player.PlayerData.gang.name}, function(gangResult)
-                    cb(gangResult and #gangResult > 0)
-                end)
-            else
-                cb(false)
+            local vehicle = result[1]
+            
+            -- Check if player owns the vehicle directly
+            if vehicle.citizenid == citizenid then
+                cb(true)
+                return
             end
+            
+            -- Check if vehicle is in a shared garage the player has access to
+            if vehicle.shared_garage_id then
+                local sharedGarageId = vehicle.shared_garage_id
+                
+                -- Check if player is a member of this shared garage
+                MySQL.Async.fetchAll('SELECT * FROM shared_garage_members WHERE garage_id = ? AND member_citizenid = ?', 
+                    {sharedGarageId, citizenid}, function(memberResult)
+                        if memberResult and #memberResult > 0 then
+                            cb(true)
+                        else
+                            -- Check if player is the owner of the shared garage
+                            MySQL.Async.fetchAll('SELECT * FROM shared_garages WHERE id = ? AND owner_citizenid = ?', 
+                                {sharedGarageId, citizenid}, function(ownerResult)
+                                    if ownerResult and #ownerResult > 0 then
+                                        cb(true)
+                                    else
+                                        -- Check gang vehicles as fallback
+                                        if Player.PlayerData.gang and Player.PlayerData.gang.name ~= "none" then
+                                            MySQL.Async.fetchAll('SELECT * FROM gang_vehicles WHERE plate = ? AND gang = ?', {plate, Player.PlayerData.gang.name}, function(gangResult)
+                                                cb(gangResult and #gangResult > 0)
+                                            end)
+                                        else
+                                            cb(false)
+                                        end
+                                    end
+                                end
+                            )
+                        end
+                    end
+                )
+            else
+                -- Check gang vehicles if not in shared garage
+                if Player.PlayerData.gang and Player.PlayerData.gang.name ~= "none" then
+                    MySQL.Async.fetchAll('SELECT * FROM gang_vehicles WHERE plate = ? AND gang = ?', {plate, Player.PlayerData.gang.name}, function(gangResult)
+                        cb(gangResult and #gangResult > 0)
+                    end)
+                else
+                    cb(false)
+                end
+            end
+        else
+            cb(false)
         end
     end)
 end)
@@ -1586,21 +1804,69 @@ QBCore.Functions.CreateCallback('dw-garages:server:CanPayImpoundFee', function(s
 end)
 
 QBCore.Functions.CreateCallback('dw-garages:server:GetVehicleByPlate', function(source, cb, plate)
-    if OutsideVehicles[plate] then
-        cb(nil, true) -- Vehicle is already outside
+    if not plate then
+        cb(nil, false) -- No plate provided
         return
     end
     
-    MySQL.Async.fetchAll('SELECT * FROM player_vehicles WHERE plate = ?', {plate}, function(result)
-        if result and #result > 0 then
-            if result[1].state == 0 then
-                cb(nil, true) -- Vehicle is already out according to DB
-            else
-                cb(result[1], false) -- Vehicle is available
-            end
-        else
-            cb(nil, false) -- Vehicle not found
+    -- Clean the plate (remove spaces and ensure proper format)
+    plate = plate:gsub("%s+", "")
+    
+    -- First check for impounded vehicles (state = 2) - these should always be returned
+    MySQL.Async.fetchAll('SELECT * FROM player_vehicles WHERE plate = ? AND state = 2', {plate}, function(impoundResult)
+        if impoundResult and #impoundResult > 0 then
+            -- Found impounded vehicle - return it
+            cb(impoundResult[1], false)
+            return
         end
+        
+        -- Not impounded, check if it's already outside
+        if OutsideVehicles[plate] then
+            cb(nil, true) -- Vehicle is already outside
+            return
+        end
+        
+        -- Check for vehicles in garage or out
+        MySQL.Async.fetchAll('SELECT * FROM player_vehicles WHERE plate = ?', {plate}, function(result)
+            if result and #result > 0 then
+                local vehicle = result[1]
+                if vehicle.state == 0 then
+                    cb(nil, true) -- Vehicle is already out according to DB
+                else
+                    cb(vehicle, false) -- Vehicle is available (in garage)
+                end
+            else
+                -- Try with spaces in plate (some databases might store with spaces)
+                local plateWithSpaces = plate:gsub("(.%d%d%d%d)", "%1 ")
+                if plateWithSpaces ~= plate then
+                    -- Try impounded first with spaces
+                    MySQL.Async.fetchAll('SELECT * FROM player_vehicles WHERE plate = ? AND state = 2', {plateWithSpaces}, function(impoundResult2)
+                        if impoundResult2 and #impoundResult2 > 0 then
+                            cb(impoundResult2[1], false)
+                            return
+                        end
+                        
+                        -- Try all states with spaces
+                        MySQL.Async.fetchAll('SELECT * FROM player_vehicles WHERE plate = ?', {plateWithSpaces}, function(result2)
+                            if result2 and #result2 > 0 then
+                                local vehicle = result2[1]
+                                if vehicle.state == 0 then
+                                    cb(nil, true)
+                                elseif vehicle.state == 2 then
+                                    cb(vehicle, false)
+                                else
+                                    cb(vehicle, false)
+                                end
+                            else
+                                cb(nil, false) -- Vehicle not found
+                            end
+                        end)
+                    end)
+                else
+                    cb(nil, false) -- Vehicle not found
+                end
+            end
+        end)
     end)
 end)
 -- Pay impound fee and release vehicle
@@ -1629,8 +1895,10 @@ RegisterNetEvent('dw-garages:server:PayImpoundFee', function(plate, fee)
         else
             Player.Functions.RemoveMoney("bank", actualFee, "impound-fee")
         end
-        MySQL.Async.execute('UPDATE player_vehicles SET state = 0, garage = NULL, impoundedtime = NULL, impoundreason = NULL, impoundedby = NULL, impoundtype = NULL, impoundfee = NULL, impoundtime = NULL WHERE plate = ?', {plate}, function(rowsChanged)
+        MySQL.Async.execute('UPDATE player_vehicles SET state = 0, garage = NULL, impoundedtime = NULL, impoundreason = NULL, impoundedby = NULL, impoundtype = NULL, impoundfee = NULL, impoundtime = NULL, last_update = ? WHERE plate = ?', {os.time(), plate}, function(rowsChanged)
             if rowsChanged > 0 then
+                -- Update OutsideVehicles tracking for LostVehicleTimeout
+                OutsideVehicles[plate] = true
                 TriggerClientEvent('QBCore:Notify', src, "You paid $" .. actualFee .. " to release your vehicle", "success")
             end
         end)
