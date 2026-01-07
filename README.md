@@ -4,7 +4,7 @@
 ![QBOX](https://img.shields.io/badge/framework-QBOX-red.svg)
 ![License](https://img.shields.io/badge/license-Commercial-green.svg)
 
-**DW-Garages** is a premium, feature-rich vehicle garage management system for QBCore FiveM servers. Take your server's vehicle management to the next level with advanced features, seamless UI, and comprehensive options.
+**DW-Garages** is a premium, feature-rich vehicle garage management system for QBOX FiveM servers. Take your server's vehicle management to the next level with advanced features, seamless UI, and comprehensive options.
 
 ## ✨ Features
 
