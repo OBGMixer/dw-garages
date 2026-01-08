@@ -1023,10 +1023,13 @@ end)
 
 Citizen.CreateThread(function()
     local trackedVehicles = {}
+    local lastSavedPositions = {} -- Track last saved position to avoid unnecessary updates
+    
     while true do
-        Wait(10000) -- Check every 10 seconds instead of 1 second
+        Wait(10000) -- Check every 10 seconds
         local vehicles = GetGamePool('CVehicle')
         local currentVehicles = {}
+        
         for _, vehicle in pairs(vehicles) do
             if DoesEntityExist(vehicle) then
                 local plate = QBCore.Functions.GetPlate(vehicle)
@@ -1035,23 +1038,48 @@ Citizen.CreateThread(function()
                     if IsEntityAMissionEntity(vehicle) then
                         currentVehicles[plate] = true
                         
-                        -- Save vehicle position and update last_update periodically for LostVehicleTimeout
                         local coords = GetEntityCoords(vehicle)
                         local heading = GetEntityHeading(vehicle)
                         local fuel = GetVehicleFuelLevel(vehicle)
-                        local vehicleData = {
-                            x = coords.x,
-                            y = coords.y,
-                            z = coords.z,
-                            heading = heading,
-                            fuel = fuel
-                        }
-                        TriggerServerEvent('dw-garages:server:SaveVehiclePosition', plate, vehicleData)
-                        TriggerServerEvent('dw-garages:server:UpdateVehicleState', plate, 0)
+                        
+                        -- Check if position changed significantly (more than 5 meters)
+                        local lastPos = lastSavedPositions[plate]
+                        local positionChanged = true
+                        local distanceChanged = 5.0 -- Only update if moved more than 5 meters
+                        
+                        if lastPos then
+                            local distance = #(vector3(coords.x, coords.y, coords.z) - vector3(lastPos.x, lastPos.y, lastPos.z))
+                            positionChanged = distance > distanceChanged
+                        end
+                        
+                        if positionChanged then
+                            -- Position changed significantly, save full position data
+                            local vehicleData = {
+                                x = coords.x,
+                                y = coords.y,
+                                z = coords.z,
+                                heading = heading,
+                                fuel = fuel
+                            }
+                            lastSavedPositions[plate] = vehicleData
+                            TriggerServerEvent('dw-garages:server:SaveVehiclePosition', plate, vehicleData, true)
+                        else
+                            -- Position hasn't changed much, just update last_update for LostVehicleTimeout
+                            -- This avoids expensive JSON encoding/decoding and mods column update
+                            TriggerServerEvent('dw-garages:server:UpdateVehicleState', plate, 0)
+                        end
                     end
                 end
             end
         end
+        
+        -- Clean up positions for vehicles that are no longer tracked
+        for plate, _ in pairs(lastSavedPositions) do
+            if not currentVehicles[plate] then
+                lastSavedPositions[plate] = nil
+            end
+        end
+        
         -- Don't mark vehicles as deleted when they disappear - let them persist
         -- LostVehicleTimeout will handle moving abandoned vehicles to impound
         trackedVehicles = currentVehicles
@@ -2060,11 +2088,33 @@ end
 RegisterNetEvent('dw-garages:client:CloseGarage')
 AddEventHandler('dw-garages:client:CloseGarage', function()
     SetNuiFocus(false, false)
+    isMenuOpen = false
+    
+    -- Reset transfer states
+    isTransferringVehicle = false
+    transferAnimationActive = false
+    currentTransferVehicle = nil
+    
+    -- Send message to NUI to close all modals
+    SendNUIMessage({
+        action = "closeAllModals"
+    })
 end)
 
 RegisterNUICallback('closeGarage', function(data, cb)
     SetNuiFocus(false, false)
-    isMenuOpen = false  
+    isMenuOpen = false
+    
+    -- Reset transfer states
+    isTransferringVehicle = false
+    transferAnimationActive = false
+    currentTransferVehicle = nil
+    
+    -- Clear any pending animations or timers
+    if currentTransferVehicle then
+        currentTransferVehicle = nil
+    end
+    
     cb({status = "success"})
 end)
 

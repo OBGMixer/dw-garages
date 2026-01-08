@@ -564,25 +564,6 @@ function storeVehicleInDatabase(src, plate, garageId, props, fuel, engineHealth,
         end)
     end)
 end
-                if rowsChanged > 0 then
-                    OutsideVehicles[plate] = nil
-                    
-                    if garageType == "gang" then
-                        local gang = Player.PlayerData.gang.name
-                        if gang and gang ~= "none" then
-                            MySQL.Async.execute('UPDATE gang_vehicles SET stored = 1 WHERE plate = ? AND gang = ?', {plate, gang})
-                        end
-                    end
-                    
-                    -- Trigger refresh events
-                    TriggerClientEvent('dw-garages:client:RefreshVehicleList', src)
-                else
-                    TriggerClientEvent('QBCore:Notify', src, "Failed to store vehicle", "error")
-                end
-            end)
-        end)
-    end)
-end)
 
 
 RegisterNetEvent('dw-garages:server:UpdateGangVehicleState', function(plate, state)
@@ -1009,31 +990,44 @@ end
 
 RegisterNetEvent('dw-garages:server:UpdateVehicleState', function(plate, state)
     -- Remove the 'stored' column reference
-    MySQL.Async.execute('UPDATE player_vehicles SET state = ?, last_update = ? WHERE plate = ?', 
-        {state, os.time(), plate}, 
-        function(rowsChanged)
-            if rowsChanged > 0 then
-                
-                -- Update OutsideVehicles tracking table
-                if state == 0 then
-                    OutsideVehicles[plate] = true
-                else
-                    OutsideVehicles[plate] = nil
-                end
+    local query = 'UPDATE player_vehicles SET state = ?, last_update = ? WHERE plate = ?'
+    local params = {state, os.time(), plate}
+    
+    MySQL.Async.execute(query, params, function(rowsChanged)
+        if rowsChanged > 0 then
+            -- Update OutsideVehicles tracking table
+            if state == 0 then
+                OutsideVehicles[plate] = true
             else
-                Wait (100)
+                OutsideVehicles[plate] = nil
             end
         end
-    )
+    end)
 end)
 
-RegisterNetEvent('dw-garages:server:SaveVehiclePosition', function(plate, vehicleData)
+RegisterNetEvent('dw-garages:server:SaveVehiclePosition', function(plate, vehicleData, updateMods)
     if not plate or not vehicleData then return end
     
     plate = plate:gsub("%s+", "")
+    updateMods = updateMods ~= false -- Default to true if not specified
+    
+    -- If only updating last_update (position hasn't changed), do a lightweight update
+    if not updateMods then
+        -- Just update last_update for LostVehicleTimeout tracking
+        MySQL.Async.execute('UPDATE player_vehicles SET last_update = ? WHERE plate = ? AND state = 0', 
+            {os.time(), plate}, 
+            function(rowsChanged)
+                if rowsChanged > 0 then
+                    OutsideVehicles[plate] = true
+                end
+            end
+        )
+        return
+    end
     
     -- Save vehicle position to database (store in mods or a separate column if available)
-    MySQL.Async.fetchAll('SELECT * FROM player_vehicles WHERE plate = ? AND state = 0', {plate}, function(result)
+    -- Combined update to avoid deadlocks - updates both mods and last_update in one query
+    MySQL.Async.fetchAll('SELECT mods FROM player_vehicles WHERE plate = ? AND state = 0 LIMIT 1', {plate}, function(result)
         if result and #result > 0 then
             local mods = {}
             if result[1].mods then
@@ -1043,12 +1037,18 @@ RegisterNetEvent('dw-garages:server:SaveVehiclePosition', function(plate, vehicl
             -- Store position in mods object
             mods.lastPosition = vehicleData
             
-            MySQL.Async.execute('UPDATE player_vehicles SET mods = ?, last_update = ? WHERE plate = ? AND state = 0', 
-                {json.encode(mods), os.time(), plate}, 
-                function(rowsChanged)
-                    -- Position saved
+            -- Combined query: update mods, state (keep at 0), and last_update in one operation
+            -- This prevents deadlocks by doing everything in a single atomic operation
+            -- Using LIMIT in SELECT and only fetching mods column to reduce data transfer
+            local query = 'UPDATE player_vehicles SET mods = ?, state = ?, last_update = ? WHERE plate = ? AND state = 0'
+            local params = {json.encode(mods), 0, os.time(), plate}
+            
+            MySQL.Async.execute(query, params, function(rowsChanged)
+                if rowsChanged > 0 then
+                    -- Ensure OutsideVehicles tracking is updated
+                    OutsideVehicles[plate] = true
                 end
-            )
+            end)
         end
     end)
 end)

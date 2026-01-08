@@ -93,6 +93,11 @@ window.addEventListener('message', function(event) {
         case 'closeGarage':
             closeGarage();
             break;
+        case 'closeAllModals':
+            closeAllModals();
+            closeTransferModal();
+            if (DOM.joinRequestModal) DOM.joinRequestModal.classList.add('hidden');
+            break;
         case 'openSharedGarageManager':
             openSharedGarageManager(data);
             break;
@@ -580,7 +585,18 @@ function refreshAllVehicleStates() {
 
 
 function closeGarage() {
+    // Close all modals and popups first
+    closeAllModals();
+    closeTransferModal();
+    
+    // Hide all UI elements
     DOM.garageContainer.classList.add('hidden');
+    
+    // Hide hover panel if visible
+    if (DOM.vehicleHoverPanel) {
+        DOM.vehicleHoverPanel.classList.add('hidden');
+    }
+    
     selectedVehicle = null;
     
     // Reset all state variables
