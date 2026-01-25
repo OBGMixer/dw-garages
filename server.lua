@@ -4,7 +4,6 @@ local activeImpounds = {}
 local OutsideVehicles = {}
 local trackedJobVehicles = {}
 local occupiedJobParkingSpots = {}
-local trackedJobVehicles = {}
 local jobVehicles = {}
 
 
@@ -25,8 +24,6 @@ QBCore.Functions.CreateCallback('dw-garages:server:GetPersonalVehicles', functio
     
     MySQL.Async.fetchAll(query, params, function(result)
         if result[1] then
-            for i, vehicle in ipairs(result) do
-            end
             cb(result)
         else
             cb({})
@@ -40,8 +37,6 @@ QBCore.Functions.CreateCallback('dw-garages:server:GetVehiclesByGarage', functio
     
     MySQL.Async.fetchAll('SELECT * FROM player_vehicles WHERE garage = ?', {garageId}, function(result)
         if result and #result > 0 then
-            for i, vehicle in ipairs(result) do
-            end
             cb(result)
         else
             cb({})
@@ -303,157 +298,6 @@ QBCore.Functions.CreateCallback('dw-garages:server:GetJobVehicleData', function(
     end
 end)
 
-function FindAvailableParkingSpot(jobName)
-    local spots = GetJobParkingSpots(jobName)
-    if #spots == 0 then return nil end
-    
-    -- Initialize job parking spots table if needed
-    if not occupiedJobParkingSpots[jobName] then
-        occupiedJobParkingSpots[jobName] = {}
-        
-        -- Check all existing vehicles to see if they're in parking spots
-        local vehicles = GetGamePool('CVehicle')
-        for _, veh in ipairs(vehicles) do
-            if DoesEntityExist(veh) then
-                local vehCoords = GetEntityCoords(veh)
-                
-                for spotIndex, spot in ipairs(spots) do
-                    local spotCoords = vector3(spot.x, spot.y, spot.z)
-                    if #(vehCoords - spotCoords) < 2.5 then
-                        occupiedJobParkingSpots[jobName][spotIndex] = true
-                        break
-                    end
-                end
-            end
-        end
-    end
-    
-    -- Find the first available spot
-    for spotIndex, spot in ipairs(spots) do
-        if not occupiedJobParkingSpots[jobName][spotIndex] then
-            return spotIndex, spot
-        end
-    end
-    
-    return nil
-end
-
-function ParkJobVehicle(vehicle, jobName)
-    if not DoesEntityExist(vehicle) then return false end
-    if not jobName then return false end
-    
-    -- Find an available parking spot
-    local spotIndex, parkingSpot = FindAvailableParkingSpot(jobName)
-    
-    if not parkingSpot then
-        QBCore.Functions.Notify("No available parking spots", "error")
-        return false
-    end
-    
-    -- Mark this spot as occupied
-    SetSpotState(jobName, spotIndex, true)
-    
-    -- Save vehicle properties
-    local plate = QBCore.Functions.GetPlate(vehicle)
-    local props = QBCore.Functions.GetVehicleProperties(vehicle)
-    
-    -- Get current vehicle state
-    local engineHealth = GetVehicleEngineHealth(vehicle)
-    local bodyHealth = GetVehicleBodyHealth(vehicle)
-    local fuelLevel = GetVehicleFuelLevel(vehicle)
-    
-    -- Set vehicle as mission entity
-    SetEntityAsMissionEntity(vehicle, true, true)
-    
-    -- Disable collisions during the process
-    SetEntityCollision(vehicle, false, false)
-    
-    -- Start the animation sequence
-    QBCore.Functions.Notify("Parking vehicle...", "primary")
-    
-    -- Simple fade out
-    local alpha = 255
-    local startTime = GetGameTimer()
-    local fadeOutDuration = 1000 -- 1 second fade out
-    
-    -- Fade Out Thread
-    CreateThread(function()
-        while alpha > 192 and DoesEntityExist(vehicle) do
-            local elapsedTime = GetGameTimer() - startTime
-            local progress = math.min(1.0, elapsedTime / fadeOutDuration)
-            alpha = math.floor(255 - (255 - 192) * progress)
-            
-            SetEntityAlpha(vehicle, alpha, false)
-            
-            Wait(10)
-        end
-        
-        -- Teleport vehicle to parking spot instantly after fade
-        SetEntityCoordsNoOffset(vehicle, parkingSpot.x, parkingSpot.y, parkingSpot.z, false, false, false)
-        SetEntityHeading(vehicle, parkingSpot.w)
-        
-        -- Set final vehicle state
-        SetEntityAlpha(vehicle, 192, false) -- 75% opacity
-        SetEntityCollision(vehicle, true, true)
-        SetVehicleDoorsLocked(vehicle, 1) -- Unlocked but only for job members
-        SetVehicleEngineOn(vehicle, false, true, true)
-        SetVehicleEngineHealth(vehicle, engineHealth)
-        SetVehicleBodyHealth(vehicle, bodyHealth)
-        SetVehicleFuelLevel(vehicle, fuelLevel)
-        
-        -- Store vehicle info
-        TriggerServerEvent('dw-garages:server:TrackJobVehicle', plate, jobName, props, engineHealth, bodyHealth, fuelLevel, spotIndex)
-        
-        QBCore.Functions.Notify("Vehicle parked successfully", "success")
-    end)
-    
-    return true
-end
-
-function IsSpotAvailable(jobName, spotIndex)
-    if not occupiedJobParkingSpots[jobName] then
-        occupiedJobParkingSpots[jobName] = {}
-    end
-    
-    return not occupiedJobParkingSpots[jobName][spotIndex]
-end
-
--- Function to mark spot as occupied/available
-function SetSpotState(jobName, spotIndex, isOccupied)
-    if not occupiedJobParkingSpots[jobName] then
-        occupiedJobParkingSpots[jobName] = {}
-    end
-    
-    occupiedJobParkingSpots[jobName][spotIndex] = isOccupied
-end
-
--- Function to get parking spots for a job
-function GetJobParkingSpots(jobName)
-    -- For police, use the specific spots provided
-    if jobName == "police" then
-        return {
-            vector4(446.05395, -1025.607, 28.646846, 10.391553),
-            vector4(442.25765, -1025.844, 28.717491, 37.374588),
-            vector4(438.53656, -1026.5, 28.78754, 42.148361),
-            vector4(434.99621, -1026.865, 28.851186, 26.760805),
-            vector4(431.12667, -1027.418, 28.921892, 50.015827),
-            vector4(427.40734, -1027.538, 28.987623, 0.8152692)
-        }
-    end
-    
-    -- For other jobs, use their spawn points
-    for garageId, garage in pairs(Config.JobGarages) do
-        if garage.job == jobName then
-            if garage.spawnPoints then
-                return garage.spawnPoints
-            elseif garage.spawnPoint then
-                return {garage.spawnPoint}
-            end
-        end
-    end
-    
-    return {}
-end
 
 
 RegisterNetEvent('dw-garages:server:StoreVehicle', function(plate, garageId, props, fuel, engineHealth, bodyHealth, garageType)
@@ -690,9 +534,8 @@ AddEventHandler('onResourceStart', function(resourceName)
     if GetCurrentResourceName() ~= resourceName then return end
     
     MySQL.Async.fetchAll('SHOW COLUMNS FROM player_vehicles LIKE "impoundedtime"', {}, function(result)
-        if result and #result > 0 then
-        else
-            Wait (100)
+        if result and #result == 0 then
+            Wait(100)
         end
     end)
     
@@ -702,8 +545,6 @@ AddEventHandler('onResourceStart', function(resourceName)
             for _, v in ipairs(result) do
                 OutsideVehicles[v.plate] = true
             end
-        else
-            Wait(100)
         end
     end)
 end)
@@ -1209,14 +1050,6 @@ CreateThread(function()
     end
 end)
 
-
-CreateThread(function()
-    while true do
-        Wait(3600000)
-        CheckForLostVehicles()
-    end
-end)
-
 function takeOutSharedVehicle(src, plate, garageId)
     MySQL.Async.fetchAll('SELECT * FROM player_vehicles WHERE plate = ? AND shared_garage_id = ? AND state = 1', 
         {plate, garageId}, function(result)
@@ -1376,34 +1209,6 @@ RegisterNetEvent('QBCore:Server:OnVehicleDelete', function(plate)
 end)
 
 
---[[RegisterNetEvent('vehiclemod:server:syncDeletion', function(netId, plate)
-    if plate then
-        -- Clean the plate (remove spaces)
-        plate = plate:gsub("%s+", "")
-        
-        -- Check if this is a player-owned vehicle
-        MySQL.Async.fetchAll('SELECT * FROM player_vehicles WHERE plate = ?', {plate}, function(result)
-            if result and #result > 0 then
-                local currentTime = os.time()
-                
-                -- Update vehicle to impound state
-                MySQL.Async.execute('UPDATE player_vehicles SET state = 2, garage = "impound", impoundedtime = ?, impoundreason = ?, impoundedby = ?, impoundtype = ?, impoundfee = ? WHERE plate = ?', 
-                    {
-                        currentTime, 
-                        "Vehicle was towed", 
-                        "City Towing", 
-                        "police", 
-                        Config.ImpoundFee, 
-                        plate
-                    }
-                )
-                if OutsideVehicles[plate] then
-                    OutsideVehicles[plate] = nil
-                end
-            end
-        end)
-    end
-end)]]--
 
 RegisterNetEvent('qb-garage:server:UpdateOutsideVehicles', function(plate, state)
     if plate and state == 2 then
@@ -1946,16 +1751,6 @@ RegisterNetEvent('dw-garages:server:ImpoundVehicle', function(plate, props, reas
     )
 end)
 
-AddEventHandler('onResourceStart', function(resourceName)
-    if GetCurrentResourceName() ~= resourceName then return end
-    
-    MySQL.Async.fetchAll('SHOW COLUMNS FROM player_vehicles LIKE "impoundedtime"', {}, function(result)
-        if result and #result > 0 then
-        else
-            Wait (100)
-        end
-    end)
-end)
 
 RegisterNetEvent('dw-garages:server:ImpoundVehicleWithParams', function(plate, props, reason, impoundType, jobName, officerName, impoundFee)
     local src = source
@@ -2026,9 +1821,6 @@ QBCore.Functions.CreateCallback('dw-garages:server:GetImpoundedVehicles', functi
     -- Make sure we're properly selecting impounded vehicles (state = 2)
     MySQL.Async.fetchAll('SELECT * FROM player_vehicles WHERE citizenid = ? AND state = 2', {citizenid}, function(result)
         if result and #result > 0 then
-            -- Add debug info to help track the issue
-            for i, vehicle in ipairs(result) do
-            end
             cb(result)
         else
             cb({})
@@ -2040,8 +1832,6 @@ QBCore.Functions.CreateCallback('dw-garages:server:GetJobGarageVehicles', functi
     
     MySQL.Async.fetchAll('SELECT * FROM player_vehicles WHERE garage = ? AND state = 1', {garageId}, function(result)
         if result and #result > 0 then
-            for i, vehicle in ipairs(result) do
-            end
             cb(result)
         else
             cb({})

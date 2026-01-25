@@ -4,6 +4,7 @@ Config = {}
 Config.UseTarget = false -- Use qb-target interactions instead of DrawText3D
 Config.VehicleSpawnDistance = 5.0 -- Distance to spawn vehicles from garage point
 Config.SpawnTimeout = 30000 -- Time (in ms) before vehicle spawning times out
+Config.EnableVehicleFade = false -- Enable/disable vehicle fade animation when spawning/storing
 Config.VehicleFadeTime = 2000 -- Time in milliseconds for vehicle fade animation
 Config.TransferCost = 500 -- Cost to transfer a vehicle between garages
 Config.EnableTransferAnimation = false  -- Set to false to disable the truck animation
