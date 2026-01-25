@@ -36,12 +36,22 @@ local activeAnimations = {}
 local parkedJobVehicles = {}
 local occupiedParkingSpots = {}
 local jobParkingSpots = {}
-local occupiedParkingSpots = {}
 
+local function ApplyGarageLock(veh)
+    if not DoesEntityExist(veh) then return end
+    local lockState = 2
+    local vehicleClass = GetVehicleClass(veh)
+    if vehicleClass == 8 or vehicleClass == 13 then
+        lockState = 1 -- Bikes need to stay unlocked to allow mounting
+    end
+    SetVehicleDoorsLocked(veh, lockState)
+    SetVehicleDoorsLockedForAllPlayers(veh, false)
+    if lockState == 2 then
+        Wait(50)
+        SetVehicleDoorsLocked(veh, lockState)
+    end
+end
 
-RegisterNetEvent('QBCore:Client:OnPlayerLoaded', function()
-    PlayerData = QBCore.Functions.GetPlayerData()
-end)
 
 RegisterNetEvent('QBCore:Client:OnPlayerLoaded', function()
     PlayerData = QBCore.Functions.GetPlayerData()
@@ -236,7 +246,6 @@ function ParkJobVehicle(vehicle, jobName)
     local finalHeading = foundSpot.w
     
     SetEntityCollision(vehicle, false, false)
-    SetEntityAlpha(vehicle, 200, false)
     
     local moveDuration = 2000
     local startTime = GetGameTimer()
@@ -258,7 +267,6 @@ function ParkJobVehicle(vehicle, jobName)
         SetEntityHeading(vehicle, finalHeading)
         
         SetEntityCollision(vehicle, true, true)
-        SetEntityAlpha(vehicle, 255, false)
         
         SetVehicleDoorsLocked(vehicle, 1)
         SetVehicleEngineOn(vehicle, false, true, true)
@@ -485,6 +493,11 @@ function AnimateVehicleFade(vehicle, fromAlpha, toAlpha, duration, callback)
         return 
     end
     
+    if not Config.EnableVehicleFade then
+        if callback then callback() end
+        return
+    end
+    
     if activeAnimations[vehicle] then
         activeAnimations[vehicle] = nil
     end
@@ -497,27 +510,10 @@ function AnimateVehicleFade(vehicle, fromAlpha, toAlpha, duration, callback)
     
     CreateThread(function()
         while GetGameTimer() < endTime and DoesEntityExist(vehicle) and activeAnimations[vehicle] == animationId do
-            local progress = (GetGameTimer() - startTime) / duration
-            local currentAlpha = math.floor(fromAlpha + (toAlpha - fromAlpha) * progress)
-            
-            SetEntityAlpha(vehicle, currentAlpha, false)
-            
-            local attachedEntities = GetAllAttachedEntities(vehicle)
-            for _, attached in ipairs(attachedEntities) do
-                SetEntityAlpha(attached, currentAlpha, false)
-            end
-            
             Wait(10) 
         end
         
         if DoesEntityExist(vehicle) and activeAnimations[vehicle] == animationId then
-            SetEntityAlpha(vehicle, toAlpha, false)
-            
-            local attachedEntities = GetAllAttachedEntities(vehicle)
-            for _, attached in ipairs(attachedEntities) do
-                SetEntityAlpha(attached, toAlpha, false)
-            end
-            
             activeAnimations[vehicle] = nil
             
             if callback then callback() end
@@ -855,10 +851,7 @@ RegisterNUICallback('takeOutJobVehicle', function(data, cb)
         
         -- Lock vehicle doors (after all properties are set)
         Wait(100) -- Additional wait to ensure everything is set
-        SetVehicleDoorsLocked(veh, 2) -- Locked for players
-        SetVehicleDoorsLockedForAllPlayers(veh, false) -- Owner can still unlock
-        Wait(50)
-        SetVehicleDoorsLocked(veh, 2) -- Lock again to ensure it sticks
+        ApplyGarageLock(veh)
         
         QBCore.Functions.Notify("Job vehicle taken out", "success")
         cb({status = "success"})
@@ -1187,10 +1180,7 @@ RegisterNetEvent('dw-garages:client:RespawnVehicle', function(vehicleData, lastP
         
         -- Lock doors (do this after all properties are set)
         Wait(200)
-        SetVehicleDoorsLocked(veh, 2) -- Locked for players
-        SetVehicleDoorsLockedForAllPlayers(veh, false) -- Owner can still unlock
-        Wait(100)
-        SetVehicleDoorsLocked(veh, 2) -- Lock again to ensure it sticks
+        ApplyGarageLock(veh)
         
         -- Give keys
         TriggerEvent("vehiclekeys:client:SetOwner", plate)
@@ -1290,24 +1280,27 @@ function GetClosestVehicleInGarage(garageCoords, maxDistance)
 end
 
 function FadeOutVehicle(vehicle, callback)
-    local alpha = GetEntityAlpha(vehicle)
-    if alpha == 0 then alpha = 255 end
-    
-    local fadeTime = Config.VehicleFadeTime or 2000 
-    local steps = 20 
-    local stepTime = fadeTime / steps
-    local stepSize = math.floor(alpha / steps)
-    
-    CreateThread(function()
-        for i = steps, 0, -1 do
-            alpha = i * stepSize
-            if alpha < 0 then alpha = 0 end
-            
-            SetEntityAlpha(vehicle, alpha, false)
-            
-            Wait(stepTime)
+    if not Config.EnableVehicleFade then
+        -- When storing in garage, allow deletion even if it's a mission entity
+        -- Remove mission entity status temporarily to allow deletion
+        if DoesEntityExist(vehicle) then
+            if IsEntityAMissionEntity(vehicle) then
+                SetEntityAsMissionEntity(vehicle, false, true)
+            end
+            -- Allow network migration temporarily for deletion
+            local netId = NetworkGetNetworkIdFromEntity(vehicle)
+            if netId then
+                SetNetworkIdCanMigrate(netId, true)
+            end
+            -- Delete the vehicle
+            DeleteEntity(vehicle)
         end
         
+        if callback then callback() end
+        return
+    end
+    
+    CreateThread(function()
         -- When storing in garage, allow deletion even if it's a mission entity
         -- Remove mission entity status temporarily to allow deletion
         if DoesEntityExist(vehicle) then
@@ -1328,38 +1321,8 @@ function FadeOutVehicle(vehicle, callback)
 end
 
 function FadeInVehicle(vehicle)
-    SetEntityAlpha(vehicle, 0, false)
-    
-    local fadeTime = Config.VehicleFadeTime or 2000 
-    local steps = 20 
-    local stepTime = fadeTime / steps
-    local stepSize = math.floor(255 / steps)
-    
-    CreateThread(function()
-        for i = 0, steps do
-            local alpha = i * stepSize
-            if alpha > 255 then alpha = 255 end
-            
-            SetEntityAlpha(vehicle, alpha, false)
-            
-            Wait(stepTime)
-        end
-        
-        SetEntityAlpha(vehicle, 255, false)
-    end)
-end
-
-function SetVehicleSemiTransparent(vehicle, isTransparent)
-    if not DoesEntityExist(vehicle) then return end
-    
-    local alpha = isTransparent and 75 or 255 
-    
-    SetEntityAlpha(vehicle, alpha, false)
-    
-    local attachedEntities = GetAllAttachedEntities(vehicle)
-    for _, attached in ipairs(attachedEntities) do
-        SetEntityAlpha(attached, alpha, false)
-    end
+    -- Vehicle fade functionality removed
+    return
 end
 
 function GetAllAttachedEntities(entity)
@@ -1580,7 +1543,6 @@ CreateThread(function()
                             if isJobVehicle then
                                 if distToVehicle < 10.0 then
                                     if not isVehicleFaded or fadedVehicle ~= vehicle then
-                                        SetEntityAlpha(vehicle, 192, false)
                                         isVehicleFaded = true
                                         fadedVehicle = vehicle
                                         canStoreVehicle = true
@@ -1604,7 +1566,6 @@ CreateThread(function()
                                     end
                                 else
                                     if isVehicleFaded and fadedVehicle == vehicle then
-                                        SetEntityAlpha(vehicle, 255, false)
                                         isVehicleFaded = false
                                         fadedVehicle = nil
                                         parkingPromptShown = false
@@ -1628,7 +1589,6 @@ CreateThread(function()
                     if isOwned then
                         if distToVehicle < 10.0 then
                             if not isVehicleFaded or fadedVehicle ~= vehicle then
-                                SetEntityAlpha(vehicle, 192, false)
                                 isVehicleFaded = true
                                 fadedVehicle = vehicle
                                 canStoreVehicle = true
@@ -1648,7 +1608,6 @@ CreateThread(function()
                             end
                         else
                             if isVehicleFaded and fadedVehicle == vehicle then
-                                SetEntityAlpha(vehicle, 255, false)
                                 isVehicleFaded = false
                                 fadedVehicle = nil
                                 parkingPromptShown = false
@@ -1657,7 +1616,6 @@ CreateThread(function()
                         end
                     else
                         if isVehicleFaded and fadedVehicle == vehicle then
-                            SetEntityAlpha(vehicle, 255, false)
                             isVehicleFaded = false
                             fadedVehicle = nil
                             parkingPromptShown = false
@@ -1668,7 +1626,6 @@ CreateThread(function()
                     ::skip_vehicle::
                 else
                     if isVehicleFaded and fadedVehicle == vehicle then
-                        SetEntityAlpha(vehicle, 255, false)
                         isVehicleFaded = false
                         fadedVehicle = nil
                         parkingPromptShown = false
@@ -1677,7 +1634,6 @@ CreateThread(function()
                 end
             else
                 if isVehicleFaded and fadedVehicle == vehicle then
-                    SetEntityAlpha(vehicle, 255, false)
                     isVehicleFaded = false
                     fadedVehicle = nil
                     parkingPromptShown = false
@@ -1720,13 +1676,6 @@ CreateThread(function()
                     end, plate)
                 end
 
-                SetEntityAlpha(currentVehicle, 255, false)
-                
-                local attachedEntities = GetAllAttachedEntities(currentVehicle)
-                for _, attached in ipairs(attachedEntities) do
-                    SetEntityAlpha(attached, 255, false)
-                end
-                
                 if isVehicleFaded and fadedVehicle == currentVehicle then
                     isVehicleFaded = false
                     fadedVehicle = nil
@@ -2198,7 +2147,6 @@ RegisterNUICallback('takeOutVehicle', function(data, cb)
                         SetEntityHeading(veh, clearPoint.w)
                         SetVehicleFuelLevel(veh, data.fuel)
                         SetVehicleNumberPlateText(veh, plate)
-                        
                         FadeInVehicle(veh)
                         
                         -- Apply vehicle properties including livery
@@ -2230,10 +2178,7 @@ RegisterNUICallback('takeOutVehicle', function(data, cb)
                         
                         -- Lock vehicle doors (after all properties are set)
                         Wait(100) -- Additional wait to ensure everything is set
-                        SetVehicleDoorsLocked(veh, 2) -- Locked for players
-                        SetVehicleDoorsLockedForAllPlayers(veh, false) -- Owner can still unlock
-                        Wait(50)
-                        SetVehicleDoorsLocked(veh, 2) -- Lock again to ensure it sticks
+                        ApplyGarageLock(veh)
                         
                         TriggerServerEvent('dw-garages:server:UpdateVehicleState', plate, 0)
                         
@@ -2293,10 +2238,7 @@ RegisterNUICallback('takeOutVehicle', function(data, cb)
                     
                     -- Lock vehicle doors (after properties are applied)
                     Wait(100) -- Additional wait to ensure everything is set
-                    SetVehicleDoorsLocked(veh, 2) -- Locked for players
-                    SetVehicleDoorsLockedForAllPlayers(veh, false) -- Owner can still unlock
-                    Wait(50)
-                    SetVehicleDoorsLocked(veh, 2) -- Lock again to ensure it sticks
+                    ApplyGarageLock(veh)
                     
                     SetVehicleEngineHealth(veh, 1000.0)
                     SetVehicleBodyHealth(veh, 1000.0)
@@ -2371,7 +2313,6 @@ RegisterNetEvent('dw-garages:client:TakeOutSharedVehicle', function(plate, vehic
         SetEntityHeading(veh, clearPoint.w)
         SetVehicleFuelLevel(veh, vehicleData.fuel)
         SetVehicleNumberPlateText(veh, plate)
-        
         FadeInVehicle(veh)
         
         QBCore.Functions.TriggerCallback('dw-garages:server:GetVehicleProperties', function(properties)
@@ -2410,10 +2351,7 @@ RegisterNetEvent('dw-garages:client:TakeOutSharedVehicle', function(plate, vehic
                 
                 -- Lock vehicle doors (after all properties are set)
                 Wait(100) -- Additional wait to ensure everything is set
-                SetVehicleDoorsLocked(veh, 2) -- Locked for players
-                SetVehicleDoorsLockedForAllPlayers(veh, false) -- Owner can still unlock
-                Wait(50)
-                SetVehicleDoorsLocked(veh, 2) -- Lock again to ensure it sticks
+                ApplyGarageLock(veh)
                 
                 QBCore.Functions.Notify("Vehicle taken out from shared garage", "success")
             else
@@ -2503,22 +2441,6 @@ function PlayVehicleTransferAnimation(plate, fromGarageId, toGarageId)
         BeginTextCommandSetBlipName("STRING")
         AddTextComponentString("Transfer Truck")
         EndTextCommandSetBlipName(blip)
-        SetEntityAlpha(truck, 0, false)
-        SetEntityAlpha(driver, 0, false)
-        
-        local fadeSteps = 51 
-        for i = 1, fadeSteps do
-            local alpha = (i - 1) * 5
-            if alpha > 255 then alpha = 255 end
-            
-            SetEntityAlpha(truck, alpha, false)
-            SetEntityAlpha(driver, alpha, false)
-            
-            Wait(30) 
-        end
-        
-        SetEntityAlpha(truck, 255, false)
-        SetEntityAlpha(driver, 255, false)
         
         local vehicleFlags = 447 
         local speed = 10.0    
@@ -2643,17 +2565,7 @@ function PlayVehicleTransferAnimation(plate, fromGarageId, toGarageId)
                 
                 Wait(5000)
                 
-                for i = 255, 0, -5 do
-                    if DoesEntityExist(truck) then
-                        SetEntityAlpha(truck, i, false)
-                    end
-                    
-                    if DoesEntityExist(driver) then
-                        SetEntityAlpha(driver, i, false)
-                    end
-                    
-                    Wait(50) 
-                end
+                Wait(50)
             end
             
             RemoveBlip(blip)
@@ -3863,7 +3775,6 @@ RegisterNUICallback('releaseImpoundedVehicle', function(data, cb)
                                 SetEntityCoords(veh, spawnPoint.x, spawnPoint.y, spawnPoint.z)
                                 SetVehicleFuelLevel(veh, vehData.fuel or 100)
                                 SetVehicleNumberPlateText(veh, plate)
-                                
                                 FadeInVehicle(veh)
                                 
                                 -- Apply vehicle properties including livery
@@ -3911,27 +3822,21 @@ RegisterNUICallback('releaseImpoundedVehicle', function(data, cb)
                                 SetVehicleDirtLevel(veh, 0.0) 
                                 
                                 FixEngineSmoke(veh)
-                                
-                                SetVehicleDoorsLocked(veh, 2)
 
                                 SetVehicleUndriveable(veh, false)
                                 SetVehicleEngineOn(veh, false, true, false)
                                 
-                                -- Update vehicle state for LostVehicleTimeout tracking
-                                if plate then
-                                    TriggerServerEvent('dw-garages:server:UpdateVehicleState', plate, 0)
-                                end
-                                
                                 -- Lock vehicle doors (after all properties are set)
-                                --Wait(100) -- Additional wait to ensure everything is set
-                                SetVehicleDoorsLocked(veh, 2) -- Locked for players
-                                SetVehicleDoorsLockedForAllPlayers(veh, false) -- Owner can still unlock
-                                --Wait(50)
-                                --SetVehicleDoorsLocked(veh, 2) -- Lock again to ensure it sticks
+                                ApplyGarageLock(veh)
 
                                 TriggerEvent("vehiclekeys:client:SetOwner", plate)
                                 
+                                -- Pay fee - PayImpoundFee will update state from 2 (impounded) to 0 (outside)
+                                -- This must be called AFTER vehicle spawns to ensure proper state handling
                                 TriggerServerEvent('dw-garages:server:PayImpoundFee', plate, fee)
+                                
+                                -- PayImpoundFee already updates state to 0 and OutsideVehicles tracking
+                                -- No need for additional UpdateVehicleState call here
                                 
                                 QBCore.Functions.Notify("Vehicle released from impound", "success")
                                 cb({status = "success"})
