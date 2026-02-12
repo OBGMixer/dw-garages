@@ -98,6 +98,9 @@ window.addEventListener('message', function(event) {
             closeTransferModal();
             if (DOM.joinRequestModal) DOM.joinRequestModal.classList.add('hidden');
             break;
+        case 'closeTransferModal':
+            closeTransferModal();
+            break;
         case 'openSharedGarageManager':
             openSharedGarageManager(data);
             break;
@@ -1958,7 +1961,7 @@ function createTransferModal() {
                     <div class="input-group">
                         <label for="transfer-garage-select">Select Destination Garage</label>
                         <select id="transfer-garage-select" class="garage-input">
-                            <option value="">-- Select Garage --</option>
+                            <option value="" disabled selected>-- Select Garage --</option>
                         </select>
                     </div>
                 </div>
@@ -1973,10 +1976,53 @@ function createTransferModal() {
     // Add modal to the DOM
     document.body.insertAdjacentHTML('beforeend', modalHTML);
     
-    // Add event listeners
-    document.querySelector('#transfer-modal .close-modal').addEventListener('click', closeTransferModal);
-    document.getElementById('cancel-transfer').addEventListener('click', closeTransferModal);
-    document.getElementById('confirm-transfer').addEventListener('click', confirmTransfer);
+    // Add event listeners (only if not already added)
+    const closeBtn = document.querySelector('#transfer-modal .close-modal');
+    const cancelBtn = document.getElementById('cancel-transfer');
+    const confirmBtn = document.getElementById('confirm-transfer');
+    
+    if (closeBtn && !closeBtn.hasAttribute('data-listener-added')) {
+        closeBtn.addEventListener('click', closeTransferModal);
+        closeBtn.setAttribute('data-listener-added', 'true');
+    }
+    
+    if (cancelBtn && !cancelBtn.hasAttribute('data-listener-added')) {
+        cancelBtn.addEventListener('click', closeTransferModal);
+        cancelBtn.setAttribute('data-listener-added', 'true');
+    }
+    
+    if (confirmBtn && !confirmBtn.hasAttribute('data-listener-added')) {
+        confirmBtn.addEventListener('click', confirmTransfer);
+        confirmBtn.setAttribute('data-listener-added', 'true');
+    }
+    
+    // Add backdrop click handler to close modal
+    const backdrop = document.querySelector('#transfer-modal .modal-backdrop');
+    if (backdrop && !backdrop.hasAttribute('data-listener-added')) {
+        backdrop.addEventListener('click', closeTransferModal);
+        backdrop.setAttribute('data-listener-added', 'true');
+    }
+}
+
+// Function to update transfer button state
+function updateTransferButtonState() {
+    const transferBtn = document.getElementById('confirm-transfer');
+    const select = document.getElementById('transfer-garage-select');
+    
+    if (transferBtn && select) {
+        // Enable transfer button only if a valid garage is selected (not empty)
+        if (select.value && select.value.trim() !== '') {
+            transferBtn.disabled = false;
+            transferBtn.style.opacity = '1';
+            transferBtn.style.cursor = 'pointer';
+            transferBtn.style.pointerEvents = 'auto';
+        } else {
+            transferBtn.disabled = true;
+            transferBtn.style.opacity = '0.5';
+            transferBtn.style.cursor = 'not-allowed';
+            transferBtn.style.pointerEvents = 'none';
+        }
+    }
 }
 
 // Open transfer modal
@@ -1993,6 +2039,25 @@ function openTransferModal() {
     
     // Populate garage select
     populateGarageSelect();
+    
+    // Get elements
+    const transferBtn = document.getElementById('confirm-transfer');
+    const select = document.getElementById('transfer-garage-select');
+    
+    if (transferBtn && select) {
+        // Reset select to placeholder and disable button initially
+        select.value = '';
+        updateTransferButtonState();
+        
+        // Remove old listener if it exists (using a named function reference)
+        if (select.onTransferChange) {
+            select.removeEventListener('change', select.onTransferChange);
+        }
+        
+        // Create and store the listener function
+        select.onTransferChange = updateTransferButtonState;
+        select.addEventListener('change', select.onTransferChange);
+    }
     
     // Show the modal
     document.getElementById('transfer-modal').classList.remove('hidden');
@@ -2018,8 +2083,13 @@ function populateGarageSelect() {
     // Skip if we don't have garage data
     if (!window.allGarages || !Array.isArray(window.allGarages)) return;
     
-    // Add options for each garage - include ALL garages
+    // Add options for each garage - filter out blank/empty garages
     window.allGarages.forEach(garage => {
+        // Skip garages with blank/empty names or missing IDs
+        if (!garage || !garage.id || !garage.name || garage.name.trim() === '') {
+            return;
+        }
+        
         const option = document.createElement('option');
         option.value = garage.id;
         
@@ -2042,8 +2112,15 @@ function populateGarageSelect() {
 function confirmTransfer() {
     console.log("Confirm transfer function called");
     const select = document.getElementById('transfer-garage-select');
+    const transferBtn = document.getElementById('confirm-transfer');
     
-    if (!select || !select.value) {
+    // Prevent transfer if button is disabled
+    if (transferBtn && transferBtn.disabled) {
+        return;
+    }
+    
+    // Validate that a valid garage is selected (not empty or placeholder)
+    if (!select || !select.value || select.value.trim() === '' || select.value === '') {
         // Show error notification
         if (typeof QBCore !== 'undefined' && QBCore.Functions && QBCore.Functions.Notify) {
             QBCore.Functions.Notify('Please select a destination garage', 'error');

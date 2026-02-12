@@ -6,6 +6,7 @@ local isMenuOpen = false
 local currentVehicleData = nil
 local isPlayerLoaded = false
 local sharedGaragesData = {}
+local houseGaragesData = {} -- Store house garage data: {propertyId = {coords, label, spawnPoint}}
 local pendingJoinRequests = {}
 local isHoveringVehicle = false
 local hoveredVehicle = nil
@@ -15,7 +16,6 @@ local hoveredNetId = nil
 local isGarageMenuOpen = false
 local isVehicleFaded = false
 local fadedVehicle = nil
-local parkingPromptShown = false
 local canStoreVehicle = false
 local isStorageInProgress = false
 local vehicleOwnershipCache = {}
@@ -26,6 +26,8 @@ local currentTransferVehicle = nil
 local isAtImpoundLot = false
 local currentImpoundLot = nil
 local impoundBlips = {}
+local jobGarageBlips = {} -- Store job garage blips
+local gangGarageBlips = {} -- Store gang garage blips
 local lastGarageCheckTime = nil
 local lastGarageId = nil
 local lastGarageType = nil
@@ -36,6 +38,8 @@ local activeAnimations = {}
 local parkedJobVehicles = {}
 local occupiedParkingSpots = {}
 local jobParkingSpots = {}
+local vehicleTargetZones = {} -- Track ox_target zones for vehicles: {vehicle = optionName}
+local garageTargetZones = {} -- Track ox_target zones for garages: {garageKey = zoneId}
 
 local function ApplyGarageLock(veh)
     if not DoesEntityExist(veh) then return end
@@ -60,8 +64,11 @@ RegisterNetEvent('QBCore:Client:OnPlayerLoaded', function()
     -- Wait a bit for player to fully spawn
     Wait(5000)
     
-    -- Request server to respawn any vehicles that should be out
-    TriggerServerEvent('dw-garages:server:RespawnPlayerVehicles')
+    -- Update job/gang blips now that player is loaded
+    UpdateJobGangBlips()
+    
+    -- Clean up any duplicate vehicles
+    CleanupDuplicateVehicles()
 end)
 
 AddEventHandler('onResourceStart', function(resourceName)
@@ -72,6 +79,36 @@ AddEventHandler('onResourceStart', function(resourceName)
     if LocalPlayer.state.isLoggedIn then
         PlayerData = QBCore.Functions.GetPlayerData()
         isPlayerLoaded = true
+        -- Update job/gang blips if player is already logged in
+        Wait(2000)
+        UpdateJobGangBlips()
+        -- Wait a bit before cleanup to ensure all vehicles are loaded
+        Wait(3000)
+        -- Clean up any duplicate vehicles (only on resource start)
+        CleanupDuplicateVehicles()
+    end
+end)
+
+AddEventHandler('onResourceStop', function(resourceName)
+    if GetCurrentResourceName() ~= resourceName then return end
+    
+    -- Clean up all ox_target zones
+    if vehicleTargetZones then
+        for vehicle, zoneId in pairs(vehicleTargetZones) do
+            if zoneId then
+                exports.ox_target:removeZone(zoneId)
+            end
+        end
+        vehicleTargetZones = {}
+    end
+    
+    if garageTargetZones then
+        for garageKey, zoneId in pairs(garageTargetZones) do
+            if zoneId then
+                exports.ox_target:removeZone(zoneId)
+            end
+        end
+        garageTargetZones = {}
     end
 end)
 
@@ -81,14 +118,87 @@ end)
 
 RegisterNetEvent('QBCore:Client:OnJobUpdate', function(JobInfo)
     PlayerData.job = JobInfo
+    -- Update job garage blips when job changes
+    UpdateJobGangBlips()
 end)
 
 RegisterNetEvent('QBCore:Client:OnGangUpdate', function(GangInfo)
     PlayerData.gang = GangInfo
+    -- Update gang garage blips when gang changes
+    UpdateJobGangBlips()
 end)
 
+-- Function to remove all job/gang blips
+local function RemoveJobGangBlips()
+    -- Remove all job garage blips
+    for garageId, blip in pairs(jobGarageBlips) do
+        if DoesBlipExist(blip) then
+            RemoveBlip(blip)
+        end
+        jobGarageBlips[garageId] = nil
+    end
+    
+    -- Remove all gang garage blips
+    for garageId, blip in pairs(gangGarageBlips) do
+        if DoesBlipExist(blip) then
+            RemoveBlip(blip)
+        end
+        gangGarageBlips[garageId] = nil
+    end
+end
+
+-- Function to update job and gang garage blips based on player's current job/gang
+function UpdateJobGangBlips()
+    if not Config.GarageBlip.Enable then return end
+    
+    -- Remove existing job/gang blips
+    RemoveJobGangBlips()
+    
+    -- Wait for player data to be available
+    if not PlayerData or not isPlayerLoaded then return end
+    
+    -- Create job garage blips only for player's current job
+    if PlayerData.job and PlayerData.job.name then
+        local playerJob = PlayerData.job.name
+        for k, v in pairs(Config.JobGarages) do
+            if v.job == playerJob then
+            local blip = AddBlipForCoord(v.coords.x, v.coords.y, v.coords.z)
+            SetBlipSprite(blip, Config.GarageBlip.Sprite)
+            SetBlipDisplay(blip, Config.GarageBlip.Display)
+            SetBlipScale(blip, Config.GarageBlip.Scale)
+            SetBlipAsShortRange(blip, Config.GarageBlip.ShortRange)
+                SetBlipColour(blip, 38)
+            BeginTextCommandSetBlipName("STRING")
+            AddTextComponentSubstringPlayerName(v.label)
+            EndTextCommandSetBlipName(blip)
+                jobGarageBlips[k] = blip
+            end
+        end
+    end
+    
+    -- Create gang garage blips only for player's current gang
+    if PlayerData.gang and PlayerData.gang.name and PlayerData.gang.name ~= "none" then
+        local playerGang = PlayerData.gang.name
+        for k, v in pairs(Config.GangGarages) do
+            if v.gang == playerGang then
+            local blip = AddBlipForCoord(v.coords.x, v.coords.y, v.coords.z)
+            SetBlipSprite(blip, Config.GarageBlip.Sprite)
+            SetBlipDisplay(blip, Config.GarageBlip.Display)
+            SetBlipScale(blip, Config.GarageBlip.Scale)
+            SetBlipAsShortRange(blip, Config.GarageBlip.ShortRange)
+                SetBlipColour(blip, 59)
+            BeginTextCommandSetBlipName("STRING")
+            AddTextComponentSubstringPlayerName(v.label)
+            EndTextCommandSetBlipName(blip)
+                gangGarageBlips[k] = blip
+            end
+        end
+    end
+        end
+        
 CreateThread(function()
     if Config.GarageBlip.Enable then
+        -- Create public garage blips (always visible)
         for k, v in pairs(Config.Garages) do
             local blip = AddBlipForCoord(v.coords.x, v.coords.y, v.coords.z)
             SetBlipSprite(blip, Config.GarageBlip.Sprite)
@@ -101,29 +211,9 @@ CreateThread(function()
             EndTextCommandSetBlipName(blip)
         end
         
-        for k, v in pairs(Config.JobGarages) do
-            local blip = AddBlipForCoord(v.coords.x, v.coords.y, v.coords.z)
-            SetBlipSprite(blip, Config.GarageBlip.Sprite)
-            SetBlipDisplay(blip, Config.GarageBlip.Display)
-            SetBlipScale(blip, Config.GarageBlip.Scale)
-            SetBlipAsShortRange(blip, Config.GarageBlip.ShortRange)
-            SetBlipColour(blip, 38) 
-            BeginTextCommandSetBlipName("STRING")
-            AddTextComponentSubstringPlayerName(v.label)
-            EndTextCommandSetBlipName(blip)
-        end
-        
-        for k, v in pairs(Config.GangGarages) do
-            local blip = AddBlipForCoord(v.coords.x, v.coords.y, v.coords.z)
-            SetBlipSprite(blip, Config.GarageBlip.Sprite)
-            SetBlipDisplay(blip, Config.GarageBlip.Display)
-            SetBlipScale(blip, Config.GarageBlip.Scale)
-            SetBlipAsShortRange(blip, Config.GarageBlip.ShortRange)
-            SetBlipColour(blip, 59) 
-            BeginTextCommandSetBlipName("STRING")
-            AddTextComponentSubstringPlayerName(v.label)
-            EndTextCommandSetBlipName(blip)
-        end
+        -- Wait for player to load before creating job/gang blips
+        Wait(2000)
+        UpdateJobGangBlips()
     end
 end)
 
@@ -187,40 +277,12 @@ function ParkJobVehicle(vehicle, jobName)
     if not DoesEntityExist(vehicle) then return false end
     if not jobName then return false end
     
-    local parkingSpots = Config.JobParkingSpots[jobName]
-    if not parkingSpots or #parkingSpots == 0 then
-        QBCore.Functions.Notify("No parking spots found", "error")
-        return false
-    end
-    
-    local foundSpot = nil
-    for _, spot in ipairs(parkingSpots) do
-        local occupied = false
-        local spotCoords = vector3(spot.x, spot.y, spot.z)
-        
-        local vehicles = GetGamePool('CVehicle')
-        for _, veh in ipairs(vehicles) do
-            if veh ~= vehicle and DoesEntityExist(veh) then
-                local vehCoords = GetEntityCoords(veh)
-                if #(vehCoords - spotCoords) < 2.5 then
-                    occupied = true
-                    break
-                end
-            end
-        end
-        
-        if not occupied then
-            foundSpot = spot
-            break
-        end
-    end
-    
-    if not foundSpot then
-        QBCore.Functions.Notify("All parking spots are occupied", "error")
-        return false
-    end
-    
+    -- Job vehicles should be put away (despawned), not parked in-world.
     local plate = QBCore.Functions.GetPlate(vehicle)
+    if not plate then
+        QBCore.Functions.Notify("Couldn't read vehicle plate", "error")
+        return false
+    end
     local props = QBCore.Functions.GetVehicleProperties(vehicle)
     
     -- Explicitly capture and save livery to props
@@ -237,46 +299,12 @@ function ParkJobVehicle(vehicle, jobName)
     
     SetEntityAsMissionEntity(vehicle, true, true)
     
-    QBCore.Functions.Notify("Parking vehicle...", "primary")
+    QBCore.Functions.Notify("Storing vehicle...", "primary")
     
-    local initialVehicleCoords = GetEntityCoords(vehicle)
-    local initialHeading = GetEntityHeading(vehicle)
-    
-    local spotCoords = vector3(foundSpot.x, foundSpot.y, foundSpot.z)
-    local finalHeading = foundSpot.w
-    
-    SetEntityCollision(vehicle, false, false)
-    
-    local moveDuration = 2000
-    local startTime = GetGameTimer()
-    
-    CreateThread(function()
-        while GetGameTimer() - startTime < moveDuration do
-            local progress = (GetGameTimer() - startTime) / moveDuration
-            local currentX = Lerp(initialVehicleCoords.x, spotCoords.x, progress)
-            local currentY = Lerp(initialVehicleCoords.y, spotCoords.y, progress)
-            local currentZ = Lerp(initialVehicleCoords.z, spotCoords.z, progress)
-            local currentHeading = Lerp(initialHeading, finalHeading, progress)
-            
-            SetEntityCoordsNoOffset(vehicle, currentX, currentY, currentZ, false, false, false)
-            SetEntityHeading(vehicle, currentHeading)
-            Wait(0)
-        end
-        
-        SetEntityCoordsNoOffset(vehicle, spotCoords.x, spotCoords.y, spotCoords.z, false, false, false)
-        SetEntityHeading(vehicle, finalHeading)
-        
-        SetEntityCollision(vehicle, true, true)
-        
-        SetVehicleDoorsLocked(vehicle, 1)
-        SetVehicleEngineOn(vehicle, false, true, true)
-        SetVehicleEngineHealth(vehicle, engineHealth)
-        SetVehicleBodyHealth(vehicle, bodyHealth)
-        SetVehicleFuelLevel(vehicle, fuelLevel)
-        
+    -- Save/track job vehicle state server-side, then delete the entity client-side
         TriggerServerEvent('dw-garages:server:TrackJobVehicle', plate, jobName, props)
-        
-        QBCore.Functions.Notify("Vehicle parked successfully", "success")
+    FadeOutVehicle(vehicle, function()
+        QBCore.Functions.Notify("Vehicle stored", "success")
     end)
     
     return true
@@ -392,7 +420,7 @@ RegisterNUICallback('confirmRemoveVehicle', function(data, cb)
             header = "No, cancel",
             txt = "Keep vehicle in shared garage",
             params = {
-                event = ""
+                event = "dw-garages:client:RestoreGarageFocus"
             }
         },
     }
@@ -400,6 +428,13 @@ RegisterNUICallback('confirmRemoveVehicle', function(data, cb)
     exports['qb-menu']:openMenu(removeMenu)
     
     cb({status = "success"})
+end)
+
+-- Restore NUI focus after qb-menu confirmations/cancels
+RegisterNetEvent('dw-garages:client:RestoreGarageFocus', function()
+    if isMenuOpen then
+        SetNuiFocus(true, true)
+    end
 end)
 
 RegisterNetEvent('dw-garages:client:ConfirmDeleteGarage', function(data)
@@ -426,7 +461,10 @@ RegisterNetEvent('dw-garages:client:ConfirmRemoveVehicle', function(data)
         callbackRegistry[data.callback] = nil
     end
     
-    SetNuiFocus(false, false)
+    -- Keep the garage UI interactive while server handles removal
+    if isMenuOpen then
+        SetNuiFocus(true, true)
+    end
 end)
 
 RegisterNetEvent('dw-garages:client:CancelRemoveVehicle', function(data)
@@ -435,7 +473,9 @@ RegisterNetEvent('dw-garages:client:CancelRemoveVehicle', function(data)
         callbackRegistry[data.callback] = nil
     end
     
-    SetNuiFocus(false, false)
+    if isMenuOpen then
+        SetNuiFocus(true, true)
+    end
 end)
 
 callbackRegistry = {}
@@ -495,7 +535,7 @@ function AnimateVehicleFade(vehicle, fromAlpha, toAlpha, duration, callback)
     
     if not Config.EnableVehicleFade then
         if callback then callback() end
-        return
+        return 
     end
     
     if activeAnimations[vehicle] then
@@ -835,10 +875,11 @@ RegisterNUICallback('takeOutJobVehicle', function(data, cb)
         SetEntityAsMissionEntity(veh, true, true)
         SetEntityCanBeDamaged(veh, true)
         SetEntityInvincible(veh, false)
-        SetNetworkIdCanMigrate(NetworkGetNetworkIdFromEntity(veh), false)
+        if NetworkGetEntityIsNetworked(veh) then
+            SetNetworkIdCanMigrate(NetworkGetNetworkIdFromEntity(veh), false)
+        end
         
         SetEntityHeading(veh, clearPoint.w)
-        SetVehicleFuelLevel(veh, 100)
         FadeInVehicle(veh)
         
         SetVehicleEngineHealth(veh, 1000.0)
@@ -852,6 +893,31 @@ RegisterNUICallback('takeOutJobVehicle', function(data, cb)
         -- Lock vehicle doors (after all properties are set)
         Wait(100) -- Additional wait to ensure everything is set
         ApplyGarageLock(veh)
+        
+        -- Set fuel after vehicle is fully initialized (use fuel export if available)
+        Wait(200) -- Wait for fuel system to initialize
+        local fuelSet = false
+        if GetResourceState('LegacyFuel') ~= 'missing' then
+            local success, result = pcall(function() return exports['LegacyFuel']:SetFuel(veh, 100.0) end)
+            if success then fuelSet = true end
+        end
+        if not fuelSet and GetResourceState('ps-fuel') ~= 'missing' then
+            local success, result = pcall(function() return exports['ps-fuel']:SetFuel(veh, 100.0) end)
+            if success then fuelSet = true end
+        end
+        if not fuelSet and GetResourceState('qb-fuel') ~= 'missing' then
+            local success, result = pcall(function() return exports['qb-fuel']:SetFuel(veh, 100.0) end)
+            if success then fuelSet = true end
+        end
+        if not fuelSet then
+            SetVehicleFuelLevel(veh, 100.0)
+        end
+        
+        -- Give keys to player
+        local plate = QBCore.Functions.GetPlate(veh)
+        if plate then
+            TriggerEvent("vehiclekeys:client:SetOwner", plate)
+        end
         
         QBCore.Functions.Notify("Job vehicle taken out", "success")
         cb({status = "success"})
@@ -886,6 +952,15 @@ RegisterNUICallback('refreshVehicles', function(data, cb)
         end, gang, garageId)
     elseif garageType == "shared" then
         QBCore.Functions.TriggerCallback('dw-garages:server:GetSharedGarageVehicles', function(vehicles)
+            if vehicles then
+                SendNUIMessage({
+                    action = "refreshVehicles",
+                    vehicles = FormatVehiclesForNUI(vehicles)
+                })
+            end
+        end, garageId)
+    elseif garageType == "house" then
+        QBCore.Functions.TriggerCallback('dw-garages:server:GetHouseGarageVehicles', function(vehicles)
             if vehicles then
                 SendNUIMessage({
                     action = "refreshVehicles",
@@ -1007,19 +1082,26 @@ Citizen.CreateThread(function()
                 end
             end
             -- Not a player vehicle or no plate - safe to delete normally
-            local netId = NetworkGetNetworkIdFromEntity(vehicle)
-            TriggerServerEvent('QBCore:Server:DeleteVehicle', netId)
+            local netId = nil
+            if NetworkGetEntityIsNetworked(vehicle) then
+                netId = NetworkGetNetworkIdFromEntity(vehicle)
+            end
+            if netId then
+                TriggerServerEvent('QBCore:Server:DeleteVehicle', netId)
+            end
             return originalDeleteVehicle(vehicle)
         end
     end
 end)
 
+-- Global tracking for vehicle positions (moved outside thread for access from other functions)
+local lastSavedPositions = {} -- Track last saved position to avoid unnecessary updates
+
 Citizen.CreateThread(function()
     local trackedVehicles = {}
-    local lastSavedPositions = {} -- Track last saved position to avoid unnecessary updates
     
     while true do
-        Wait(10000) -- Check every 10 seconds
+        Wait(30000) -- Check every 30 seconds (reduced frequency to prevent spam)
         local vehicles = GetGamePool('CVehicle')
         local currentVehicles = {}
         
@@ -1027,18 +1109,28 @@ Citizen.CreateThread(function()
             if DoesEntityExist(vehicle) then
                 local plate = QBCore.Functions.GetPlate(vehicle)
                 if plate then
+                    -- Normalize plate (remove spaces) for consistent tracking
+                    local normalizedPlate = plate:gsub("%s+", "")
                     -- Only track player vehicles (mission entities)
                     if IsEntityAMissionEntity(vehicle) then
-                        currentVehicles[plate] = true
+                        currentVehicles[normalizedPlate] = true
+                        currentVehicles[plate] = true -- Also track with original format for compatibility
+                        
+                        -- Ensure vehicle remains as mission entity (prevent despawn on teleport/MLO)
+                        SetEntityAsMissionEntity(vehicle, true, true)
+                        if NetworkGetEntityIsNetworked(vehicle) then
+                            SetNetworkIdCanMigrate(NetworkGetNetworkIdFromEntity(vehicle), false)
+                        end
                         
                         local coords = GetEntityCoords(vehicle)
                         local heading = GetEntityHeading(vehicle)
                         local fuel = GetVehicleFuelLevel(vehicle)
                         
-                        -- Check if position changed significantly (more than 5 meters)
-                        local lastPos = lastSavedPositions[plate]
+                        -- Check if position changed significantly (more than 10 meters to reduce updates)
+                        -- Use normalized plate for consistent tracking
+                        local lastPos = lastSavedPositions[normalizedPlate] or lastSavedPositions[plate]
                         local positionChanged = true
-                        local distanceChanged = 5.0 -- Only update if moved more than 5 meters
+                        local distanceChanged = 10.0 -- Only update if moved more than 10 meters (increased to reduce spam)
                         
                         if lastPos then
                             local distance = #(vector3(coords.x, coords.y, coords.z) - vector3(lastPos.x, lastPos.y, lastPos.z))
@@ -1054,12 +1146,18 @@ Citizen.CreateThread(function()
                                 heading = heading,
                                 fuel = fuel
                             }
-                            lastSavedPositions[plate] = vehicleData
-                            TriggerServerEvent('dw-garages:server:SaveVehiclePosition', plate, vehicleData, true)
+                            -- Store with normalized plate for consistency
+                            lastSavedPositions[normalizedPlate] = vehicleData
+                            -- Also keep old format if different for compatibility
+                            if normalizedPlate ~= plate then
+                                lastSavedPositions[plate] = nil -- Remove old format
+                            end
+                            TriggerServerEvent('dw-garages:server:SaveVehiclePosition', normalizedPlate, vehicleData, true)
                         else
                             -- Position hasn't changed much, just update last_update for LostVehicleTimeout
                             -- This avoids expensive JSON encoding/decoding and mods column update
-                            TriggerServerEvent('dw-garages:server:UpdateVehicleState', plate, 0)
+                            -- Only update if it's been a while (throttled on server side)
+                            TriggerServerEvent('dw-garages:server:UpdateVehicleState', normalizedPlate, 0)
                         end
                     end
                 end
@@ -1067,15 +1165,84 @@ Citizen.CreateThread(function()
         end
         
         -- Clean up positions for vehicles that are no longer tracked
+        -- But verify vehicle is actually gone before removing (might just be out of range)
+        -- IMPORTANT: Normalize plates consistently to prevent mismatches
         for plate, _ in pairs(lastSavedPositions) do
-            if not currentVehicles[plate] then
-                lastSavedPositions[plate] = nil
+            local normalizedPlate = plate:gsub("%s+", "")
+            if not currentVehicles[normalizedPlate] and not currentVehicles[plate] then
+                -- Double-check: vehicle might still exist but not be a mission entity yet
+                -- Only remove if we're certain it's gone (don't remove too aggressively)
+                local vehicleStillExists = false
+                for _, veh in pairs(vehicles) do
+                    if DoesEntityExist(veh) then
+                        local vehPlate = QBCore.Functions.GetPlate(veh)
+                        if vehPlate then
+                            vehPlate = vehPlate:gsub("%s+", "")
+                            if vehPlate == normalizedPlate or vehPlate == plate then
+                                vehicleStillExists = true
+                                -- Re-apply mission entity status if vehicle exists but lost it
+                                if not IsEntityAMissionEntity(veh) then
+                                    SetEntityAsMissionEntity(veh, true, true)
+                                    if NetworkGetEntityIsNetworked(veh) then
+                                        SetNetworkIdCanMigrate(NetworkGetNetworkIdFromEntity(veh), false)
+                                    end
+                                end
+                                -- Re-add to currentVehicles with normalized plate
+                                currentVehicles[normalizedPlate] = true
+                                break
+                            end
+                        end
+                    end
+                end
+                
+                -- Only remove from tracking if vehicle truly doesn't exist
+                -- Don't remove if vehicle might just be temporarily out of range
+                if not vehicleStillExists then
+                    -- Only remove if we're very confident the vehicle is gone
+                    -- Keep tracking for a bit longer to prevent false removals
+                    lastSavedPositions[plate] = nil
+                end
             end
         end
         
         -- Don't mark vehicles as deleted when they disappear - let them persist
         -- LostVehicleTimeout will handle moving abandoned vehicles to impound
         trackedVehicles = currentVehicles
+    end
+end)
+
+-- Maintenance thread: Ensure all player vehicles remain persistent (prevent despawn on teleport/MLO/disconnect)
+Citizen.CreateThread(function()
+    while true do
+        Wait(30000) -- Check every 30 seconds
+        
+        if PlayerData and PlayerData.citizenid then
+            -- Get all vehicles that should be out (state = 0) for this player
+            QBCore.Functions.TriggerCallback('dw-garages:server:GetPlayerOutVehicles', function(outVehicles)
+                if outVehicles and #outVehicles > 0 then
+                    local vehicles = GetGamePool('CVehicle')
+                    
+                    -- Ensure all player vehicles maintain persistence settings
+                    for _, veh in pairs(vehicles) do
+                        if DoesEntityExist(veh) then
+                            local vehPlate = QBCore.Functions.GetPlate(veh)
+                            if vehPlate then
+                                -- Check if this is a player vehicle (mission entity)
+                                if IsEntityAMissionEntity(veh) then
+                                    -- Ensure mission entity status is maintained (prevents despawn on disconnect/teleport)
+                                    SetEntityAsMissionEntity(veh, true, true)
+                                    if NetworkGetEntityIsNetworked(veh) then
+                                        SetNetworkIdCanMigrate(NetworkGetNetworkIdFromEntity(veh), false)
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end)
+        else
+            Wait(30000) -- Wait longer if player not loaded
+        end
     end
 end)
 
@@ -1102,95 +1269,60 @@ RegisterNetEvent('QBCore:Command:DeleteVehicle', function()
     end
 end)
 
-RegisterNetEvent('dw-garages:client:RespawnVehicle', function(vehicleData, lastPosition)
-    if not vehicleData or not lastPosition then return end
+-- Flag to prevent cleanup during active gameplay (only run on initial load)
+local cleanupPerformed = false
+
+-- Clean up duplicate vehicles (same plate) - keep only the first one found
+-- Only cleans up vehicles that are mission entities (player-owned) to avoid deleting other players' vehicles
+-- Only runs once on initial load to prevent interfering with active gameplay
+function CleanupDuplicateVehicles()
+    if cleanupPerformed then return end -- Only run once
+    if not PlayerData or not PlayerData.citizenid then return end
     
-    -- Wait a moment to ensure player is fully loaded
-    Wait(2000)
-    
-    local plate = vehicleData.plate:gsub("%s+", "")
-    local model = vehicleData.vehicle
-    
-    -- Check if vehicle already exists
     local vehicles = GetGamePool('CVehicle')
+    local plateCounts = {}
+    local vehiclesByPlate = {}
+    
+    -- Count vehicles by plate (only mission entities - player-owned vehicles)
     for _, veh in pairs(vehicles) do
-        if DoesEntityExist(veh) then
+        if DoesEntityExist(veh) and IsEntityAMissionEntity(veh) then
             local vehPlate = QBCore.Functions.GetPlate(veh)
-            if vehPlate and vehPlate:gsub("%s+", "") == plate then
-                -- Vehicle already exists, don't respawn
-                return
+            if vehPlate then
+                vehPlate = vehPlate:gsub("%s+", "")
+                if not plateCounts[vehPlate] then
+                    plateCounts[vehPlate] = 0
+                    vehiclesByPlate[vehPlate] = {}
+                end
+                plateCounts[vehPlate] = plateCounts[vehPlate] + 1
+                table.insert(vehiclesByPlate[vehPlate], veh)
             end
         end
     end
     
-    -- Spawn vehicle at last position
-    local spawnCoords = vector3(lastPosition.x, lastPosition.y, lastPosition.z)
-    QBCore.Functions.SpawnVehicle(model, function(veh)
-        if not veh or veh == 0 then
-            return
-        end
-        
-        -- Make vehicle persist when player disconnects
-        SetEntityAsMissionEntity(veh, true, true)
-        SetEntityCanBeDamaged(veh, true)
-        SetEntityInvincible(veh, false)
-        SetNetworkIdCanMigrate(NetworkGetNetworkIdFromEntity(veh), false)
-        
-        SetEntityCoords(veh, lastPosition.x, lastPosition.y, lastPosition.z)
-        SetEntityHeading(veh, lastPosition.heading or 0.0)
-        SetVehicleNumberPlateText(veh, plate)
-        
-        -- Apply vehicle properties if available
-        if vehicleData.mods then
-            local props = json.decode(vehicleData.mods) or {}
-            if props then
-                QBCore.Functions.SetVehicleProperties(veh, props)
-                Wait(200)
-                
-                -- Apply livery if it exists
-                if props.modLivery ~= nil then
-                    SetVehicleLivery(veh, props.modLivery)
-                    Wait(50)
-                    SetVehicleLivery(veh, props.modLivery)
-                elseif props.livery ~= nil then
-                    SetVehicleLivery(veh, props.livery)
-                    Wait(50)
-                    SetVehicleLivery(veh, props.livery)
+    -- Delete duplicates (keep first, delete rest) - but verify they're still mission entities
+    for plate, count in pairs(plateCounts) do
+        if count > 1 and vehiclesByPlate[plate] then
+            -- Keep the first vehicle that still exists and is a mission entity
+            local keptVehicle = nil
+            for i = 1, #vehiclesByPlate[plate] do
+                local veh = vehiclesByPlate[plate][i]
+                if DoesEntityExist(veh) and IsEntityAMissionEntity(veh) then
+                    if not keptVehicle then
+                        keptVehicle = veh
+                    else
+                        -- This is a duplicate, delete it
+                        SetEntityAsMissionEntity(veh, false, true)
+                        DeleteEntity(veh)
+                    end
                 end
             end
         end
-        
-        -- Set fuel (check lastPosition first for saved fuel, then vehicleData, default to 100)
-        local fuelLevel = 100
-        if lastPosition and lastPosition.fuel then
-            fuelLevel = lastPosition.fuel
-        elseif vehicleData.fuel then
-            fuelLevel = vehicleData.fuel
-        end
-        SetVehicleFuelLevel(veh, fuelLevel)
-        Wait(100)
-        
-        -- Set health
-        if vehicleData.engine then
-            SetVehicleEngineHealth(veh, math.max(200.0, math.min(1000.0, vehicleData.engine * 10)))
-        end
-        if vehicleData.body then
-            SetVehicleBodyHealth(veh, math.max(200.0, math.min(1000.0, vehicleData.body * 10)))
-        end
-        
-        -- Lock doors (do this after all properties are set)
-        Wait(200)
-        ApplyGarageLock(veh)
-        
-        -- Give keys
-        TriggerEvent("vehiclekeys:client:SetOwner", plate)
-        
-        -- Update state
-        TriggerServerEvent('dw-garages:server:UpdateVehicleState', plate, 0)
-        
-        QBCore.Functions.Notify("Your vehicle has been respawned", "success")
-    end, spawnCoords, true)
-end)
+    end
+    
+    cleanupPerformed = true -- Mark as performed to prevent running again
+end
+
+-- Respawn functionality removed - vehicles will persist when left out or player disconnects
 
 RegisterNUICallback('checkVehicleState', function(data, cb)
     local plate = data.plate
@@ -1284,36 +1416,58 @@ function FadeOutVehicle(vehicle, callback)
         -- When storing in garage, allow deletion even if it's a mission entity
         -- Remove mission entity status temporarily to allow deletion
         if DoesEntityExist(vehicle) then
+            local plate = QBCore.Functions.GetPlate(vehicle)
+            
             if IsEntityAMissionEntity(vehicle) then
                 SetEntityAsMissionEntity(vehicle, false, true)
             end
             -- Allow network migration temporarily for deletion
-            local netId = NetworkGetNetworkIdFromEntity(vehicle)
-            if netId then
-                SetNetworkIdCanMigrate(netId, true)
+            local netId = nil
+            if NetworkGetEntityIsNetworked(vehicle) then
+                netId = NetworkGetNetworkIdFromEntity(vehicle)
+                if netId then
+                    SetNetworkIdCanMigrate(netId, true)
+                end
             end
             -- Delete the vehicle
             DeleteEntity(vehicle)
+            
+            -- Remove from tracking immediately to prevent tracking thread from affecting other vehicles
+            if plate then
+                plate = plate:gsub("%s+", "")
+                lastSavedPositions[plate] = nil
+            end
         end
         
         if callback then callback() end
         return
-    end
+end
     
     CreateThread(function()
         -- When storing in garage, allow deletion even if it's a mission entity
         -- Remove mission entity status temporarily to allow deletion
         if DoesEntityExist(vehicle) then
+            local plate = QBCore.Functions.GetPlate(vehicle)
+            
             if IsEntityAMissionEntity(vehicle) then
                 SetEntityAsMissionEntity(vehicle, false, true)
             end
             -- Allow network migration temporarily for deletion
-            local netId = NetworkGetNetworkIdFromEntity(vehicle)
-            if netId then
-                SetNetworkIdCanMigrate(netId, true)
+            local netId = nil
+            if NetworkGetEntityIsNetworked(vehicle) then
+                netId = NetworkGetNetworkIdFromEntity(vehicle)
+                if netId then
+                    SetNetworkIdCanMigrate(netId, true)
+                end
             end
             -- Delete the vehicle
             DeleteEntity(vehicle)
+            
+            -- Remove from tracking immediately to prevent tracking thread from affecting other vehicles
+            if plate then
+                plate = plate:gsub("%s+", "")
+                lastSavedPositions[plate] = nil
+            end
         end
         
         if callback then callback() end
@@ -1382,6 +1536,19 @@ function GetClosestGaragePoint()
                     closestCoords = garageCoords
                     closestGarageType = "gang"
                 end
+            end
+        end
+    end
+    
+    -- Check house garages
+    for propertyId, garageData in pairs(houseGaragesData) do
+        if garageData.coords then
+            local dist = #(playerPos - garageData.coords)
+            if dist < closestDist then
+                closestDist = dist
+                closestGarage = propertyId
+                closestCoords = garageData.coords
+                closestGarageType = "house"
             end
         end
     end
@@ -1459,36 +1626,7 @@ function FixEngineSmoke(vehicle)
     SetEntityProofs(vehicle, false, false, false, false, false, false, false, false)
 end
 
-function DrawText3D(x, y, z, text)
-    local onScreen, _x, _y = World3dToScreen2d(x, y, z)
-    
-    if onScreen then
-        local dist = #(GetGameplayCamCoords() - vector3(x, y, z))
-        local scale = (1 / dist) * 2.5
-        local fov = (1 / GetGameplayCamFov()) * 100
-        scale = scale * fov * 0.7
-        
-        SetTextScale(0.0, 0.40 * scale)
-        SetTextFont(4)
-        SetTextProportional(1)
-        SetTextColour(255, 255, 255, 215)
-        SetTextDropShadow(0, 0, 0, 55)
-        SetTextEdge(2, 0, 0, 0, 150)
-        SetTextDropShadow()
-        SetTextOutline()
-        SetTextEntry("STRING")
-        SetTextCentre(1)
-        AddTextComponentString(text)
-        DrawText(_x, _y)
-        
-        local factor = (string.len(text)) / 370
-        DrawRect(_x, _y + 0.0125, 0.017 + factor, 0.03 * scale, 0, 0, 0, 75)
-        
-        local highlight = math.abs(math.sin(GetGameTimer() / 500)) * 50
-        DrawRect(_x, _y + 0.0125 - 0.01 * scale, 0.017 + factor, 0.002 * scale, 255, 255, 255, highlight)
-    end
-end
-
+-- Using ox_target for all interactions
 CreateThread(function()
     while true do
         local sleep = 1000
@@ -1499,9 +1637,13 @@ CreateThread(function()
         if not DoesEntityExist(vehicle) then 
             isVehicleFaded = false
             fadedVehicle = nil
-            parkingPromptShown = false
             canStoreVehicle = false
             isStorageInProgress = false
+            -- Clean up ox_target zones for deleted vehicles
+            if vehicleTargetZones[vehicle] then
+                exports.ox_target:removeLocalEntity(vehicle, vehicleTargetZones[vehicle])
+                vehicleTargetZones[vehicle] = nil
+            end
             Wait(sleep)
             goto continue
         end
@@ -1550,25 +1692,44 @@ CreateThread(function()
                                 
                                     if distToVehicle < 5.0 and not isStorageInProgress then
                                         sleep = 0
-                                        parkingPromptShown = true
-                                        DrawText3D(vehicleCoords.x, vehicleCoords.y, vehicleCoords.z + 1.0, "PRESS [E] TO PARK VEHICLE")
-                                        
-                                        if IsControlJustPressed(0, 38) and canStoreVehicle then
-                                            isStorageInProgress = true
-                                            canStoreVehicle = false
-                                            
-                                            ParkJobVehicle(vehicle, jobName)
-                                            
-                                            Citizen.SetTimeout(3000, function()
-                                                isStorageInProgress = false
-                                            end)
+                                        -- Add ox_target zone for vehicle if not already added
+                                        if not vehicleTargetZones[vehicle] then
+                                            local plate = QBCore.Functions.GetPlate(vehicle) or tostring(vehicle)
+                                            local zoneName = 'park_job_vehicle_' .. plate
+                                            -- Remove any existing target on this entity first
+                                            if vehicleTargetZones[vehicle] then
+                                                exports.ox_target:removeLocalEntity(vehicle, vehicleTargetZones[vehicle])
+                                            end
+                                            exports.ox_target:addLocalEntity(vehicle, {
+                                                {
+                                                    name = zoneName,
+                                                    icon = 'fas fa-parking',
+                                                    label = 'Park Vehicle',
+                                                    onSelect = function()
+                                                        if canStoreVehicle then
+                                                            isStorageInProgress = true
+                                                            canStoreVehicle = false
+                                                            ParkJobVehicle(vehicle, jobName)
+                                                            Citizen.SetTimeout(3000, function()
+                                                                isStorageInProgress = false
+                                                            end)
+                                                        end
+                                                    end
+                                                }
+                                            })
+                                            vehicleTargetZones[vehicle] = zoneName
                                         end
                                     end
                                 else
                                     if isVehicleFaded and fadedVehicle == vehicle then
                                         isVehicleFaded = false
                                         fadedVehicle = nil
-                                        parkingPromptShown = false
+                                        -- Remove ox_target zone when vehicle is out of range
+                                        if vehicleTargetZones[vehicle] then
+                                            local plate = QBCore.Functions.GetPlate(vehicle) or tostring(vehicle)
+                                            exports.ox_target:removeLocalEntity(vehicle, 'park_job_vehicle_' .. plate)
+                                            vehicleTargetZones[vehicle] = nil
+                                        end
                                         canStoreVehicle = false
                                     end
                                 end
@@ -1596,21 +1757,41 @@ CreateThread(function()
                         
                             if distToVehicle < 5.0 and not isStorageInProgress then
                                 sleep = 0
-                                parkingPromptShown = true
-                                DrawText3D(vehicleCoords.x, vehicleCoords.y, vehicleCoords.z + 1.0, "PRESS [E] TO STORE VEHICLE")
-                                
-                                if IsControlJustPressed(0, 38) and canStoreVehicle then
-                                    TriggerEvent('dw-garages:client:StoreVehicle', {
-                                        garageId = garageId,
-                                        garageType = garageType
-                                    })
+                                -- Add ox_target zone for vehicle if not already added
+                                if not vehicleTargetZones[vehicle] then
+                                    local plate = QBCore.Functions.GetPlate(vehicle) or tostring(vehicle)
+                                    local zoneName = 'store_vehicle_' .. plate
+                                    -- Remove any existing target on this entity first
+                                    if vehicleTargetZones[vehicle] then
+                                        exports.ox_target:removeLocalEntity(vehicle, vehicleTargetZones[vehicle])
+                                    end
+                                    exports.ox_target:addLocalEntity(vehicle, {
+                                        {
+                                            name = zoneName,
+                                            icon = 'fas fa-warehouse',
+                                            label = 'Store Vehicle',
+                                            onSelect = function()
+                                                if canStoreVehicle then
+                                                    TriggerEvent('dw-garages:client:StoreVehicle', {
+                                                        garageId = garageId,
+                                                        garageType = garageType
+                                                    })
+                                                end
+                                                    end
+                                                }
+                                            })
+                                    vehicleTargetZones[vehicle] = zoneName
                                 end
                             end
                         else
                             if isVehicleFaded and fadedVehicle == vehicle then
                                 isVehicleFaded = false
                                 fadedVehicle = nil
-                                parkingPromptShown = false
+                                -- Remove ox_target zone when vehicle is out of range
+                                if vehicleTargetZones[vehicle] then
+                                    exports.ox_target:removeLocalEntity(vehicle, vehicleTargetZones[vehicle])
+                                    vehicleTargetZones[vehicle] = nil
+                                end
                                 canStoreVehicle = false
                             end
                         end
@@ -1618,7 +1799,11 @@ CreateThread(function()
                         if isVehicleFaded and fadedVehicle == vehicle then
                             isVehicleFaded = false
                             fadedVehicle = nil
-                            parkingPromptShown = false
+                            -- Remove ox_target zone when vehicle is out of range
+                            if vehicleTargetZones[vehicle] then
+                                exports.ox_target:removeLocalEntity(vehicle, vehicleTargetZones[vehicle])
+                                vehicleTargetZones[vehicle] = nil
+                            end
                             canStoreVehicle = false
                         end
                     end
@@ -1628,7 +1813,11 @@ CreateThread(function()
                     if isVehicleFaded and fadedVehicle == vehicle then
                         isVehicleFaded = false
                         fadedVehicle = nil
-                        parkingPromptShown = false
+                        -- Remove ox_target zone when vehicle is out of range
+                        if vehicleTargetZones[vehicle] then
+                            exports.ox_target:removeZone(vehicleTargetZones[vehicle])
+                            vehicleTargetZones[vehicle] = nil
+                        end
                         canStoreVehicle = false
                     end
                 end
@@ -1636,7 +1825,11 @@ CreateThread(function()
                 if isVehicleFaded and fadedVehicle == vehicle then
                     isVehicleFaded = false
                     fadedVehicle = nil
-                    parkingPromptShown = false
+                    -- Remove ox_target zone when vehicle is out of range
+                    if vehicleTargetZones[vehicle] then
+                        exports.ox_target:removeZone(vehicleTargetZones[vehicle])
+                        vehicleTargetZones[vehicle] = nil
+                    end
                     canStoreVehicle = false
                 end
             end
@@ -1675,7 +1868,7 @@ CreateThread(function()
                         end
                     end, plate)
                 end
-
+                
                 if isVehicleFaded and fadedVehicle == currentVehicle then
                     isVehicleFaded = false
                     fadedVehicle = nil
@@ -1813,60 +2006,88 @@ CreateThread(function()
             end
         end
     else
-        while true do
-            local sleep = 1000
-            local ped = PlayerPedId()
-            local pos = GetEntityCoords(ped)
-            
-            for k, v in pairs(Config.Garages) do
-                local dist = #(pos - vector3(v.coords.x, v.coords.y, v.coords.z))
-                if dist <= 3.0 then 
-                    sleep = 0
-                    DrawText3D(v.coords.x, v.coords.y, v.coords.z, "[E] Open Garage")
-                    if IsControlJustReleased(0, 38) then
-                        TriggerEvent("dw-garages:client:OpenGarage", {garageId = k, garageType = "public"})
-                    end
-                end
-            end
-            
-            for k, v in pairs(Config.JobGarages) do
-                if PlayerData.job and PlayerData.job.name == v.job then
-                    local dist = #(pos - vector3(v.coords.x, v.coords.y, v.coords.z))
-                    if dist <= 3.0 then 
-                        sleep = 0
-                        DrawText3D(v.coords.x, v.coords.y, v.coords.z, "[E] Open Job Garage")
-                        if IsControlJustReleased(0, 38) then
-                            TriggerEvent("dw-garages:client:OpenGarage", {garageId = k, garageType = "job"})
+        -- Create ox_target zones for all garages
+        for k, v in pairs(Config.Garages) do
+            local garageKey = "public_" .. k
+            garageTargetZones[garageKey] = exports.ox_target:addSphereZone({
+                coords = vector3(v.coords.x, v.coords.y, v.coords.z),
+                radius = 2.5,
+                debug = false,
+                options = {
+                    {
+                        name = 'open_garage_' .. k,
+                        icon = 'fas fa-car',
+                        label = 'Open Garage',
+                        onSelect = function()
+                            TriggerEvent("dw-garages:client:OpenGarage", {garageId = k, garageType = "public"})
                         end
-                    end
-                end
-            end
-            
-            for k, v in pairs(Config.GangGarages) do
-                if PlayerData.gang and PlayerData.gang.name == v.gang then
-                    local dist = #(pos - vector3(v.coords.x, v.coords.y, v.coords.z))
-                    if dist <= 3.0 then 
-                        sleep = 0
-                        DrawText3D(v.coords.x, v.coords.y, v.coords.z, "[E] Open Gang Garage")
-                        if IsControlJustReleased(0, 38) then
-                            TriggerEvent("dw-garages:client:OpenGarage", {garageId = k, garageType = "gang"})
+                    }
+                }
+            })
+        end
+        
+        -- Create ox_target zones for job garages
+        for k, v in pairs(Config.JobGarages) do
+            local garageKey = "job_" .. k
+            garageTargetZones[garageKey] = exports.ox_target:addSphereZone({
+                coords = vector3(v.coords.x, v.coords.y, v.coords.z),
+                radius = 2.5,
+                debug = false,
+                options = {
+                    {
+                        name = 'open_job_garage_' .. k,
+                        icon = 'fas fa-car',
+                        label = 'Open Job Garage',
+                        onSelect = function()
+                            if PlayerData.job and PlayerData.job.name == v.job then
+                                TriggerEvent("dw-garages:client:OpenGarage", {garageId = k, garageType = "job"})
+                            end
                         end
-                    end
-                end
-            end
-            
-            for k, v in pairs(Config.ImpoundLots) do
-                local dist = #(pos - vector3(v.coords.x, v.coords.y, v.coords.z))
-                if dist <= 3.0 then 
-                    sleep = 0
-                    DrawText3D(v.coords.x, v.coords.y, v.coords.z, "[E] Check Impound Lot")
-                    if IsControlJustReleased(0, 38) then
-                        TriggerEvent("dw-garages:client:OpenImpoundLot", {impoundId = k})
-                    end
-                end
-            end
-            
-            Wait(sleep)
+                    }
+                }
+            })
+        end
+        
+        -- Create ox_target zones for gang garages
+        for k, v in pairs(Config.GangGarages) do
+            local garageKey = "gang_" .. k
+            garageTargetZones[garageKey] = exports.ox_target:addSphereZone({
+                coords = vector3(v.coords.x, v.coords.y, v.coords.z),
+                radius = 2.5,
+                debug = false,
+                options = {
+                    {
+                        name = 'open_gang_garage_' .. k,
+                        icon = 'fas fa-car',
+                        label = 'Open Gang Garage',
+                        onSelect = function()
+                            if PlayerData.gang and PlayerData.gang.name == v.gang then
+                                TriggerEvent("dw-garages:client:OpenGarage", {garageId = k, garageType = "gang"})
+                            end
+                        end
+                    }
+                }
+            })
+        end
+        
+        -- Create ox_target zones for impound lots
+        for k, v in pairs(Config.ImpoundLots) do
+            local garageKey = "impound_" .. k
+            garageTargetZones[garageKey] = exports.ox_target:addSphereZone({
+                coords = vector3(v.coords.x, v.coords.y, v.coords.z),
+                radius = 2.5,
+                debug = false,
+                options = {
+                    {
+                        name = 'open_impound_' .. k,
+                        icon = 'fas fa-car',
+                        label = 'Check Impound Lot',
+                        onSelect = function()
+                            TriggerEvent("dw-garages:client:OpenImpoundLot", {impoundId = k})
+                        end
+                    }
+                }
+            })
         end
     end
 end)
@@ -1929,6 +2150,13 @@ function OpenGarageUI(vehicles, garageInfo, garageType)
 end
 
 RegisterNetEvent('dw-garages:client:OpenGarage', function(data)
+    -- Reset any stuck transfer states before opening
+    if isTransferringVehicle then
+        isTransferringVehicle = false
+        transferAnimationActive = false
+        currentTransferVehicle = nil
+    end
+    
     if isMenuOpen then return end
     isMenuOpen = true
    
@@ -1944,6 +2172,8 @@ RegisterNetEvent('dw-garages:client:OpenGarage', function(data)
     elseif garageType == "gang" then
         garageInfo = Config.GangGarages[garageId]
     elseif garageType == "shared" then
+        garageInfo = data.garageInfo
+    elseif garageType == "house" then
         garageInfo = data.garageInfo
     elseif garageType == "impound" then
         garageInfo = Config.ImpoundLots[garageId]
@@ -1967,10 +2197,88 @@ RegisterNetEvent('dw-garages:client:OpenGarage', function(data)
         QBCore.Functions.TriggerCallback('dw-garages:server:GetSharedGarageVehicles', function(vehicles)
             OpenGarageUI(vehicles or {}, garageInfo, garageType, isImpoundLot)
         end, garageId)
+    elseif garageType == "house" then
+        QBCore.Functions.TriggerCallback('dw-garages:server:GetHouseGarageVehicles', function(vehicles)
+            OpenGarageUI(vehicles or {}, garageInfo, garageType, isImpoundLot)
+        end, garageId)
     elseif garageType == "impound" then
         QBCore.Functions.TriggerCallback('dw-garages:server:GetImpoundedVehicles', function(vehicles)
             OpenGarageUI(vehicles or {}, garageInfo, garageType, isImpoundLot)
         end)
+    end
+end)
+
+-- Event for ps-housing to register house garage (for parking detection, doesn't open menu)
+RegisterNetEvent('dw-garages:client:RegisterHouseGarage', function(propertyId, garageData)
+    if not propertyId or not garageData then return end
+    
+    -- Store house garage data for parking detection
+    local coords = garageData.coords or garageData.spawnPoint or garageData.takeVehicle
+    if coords then
+        houseGaragesData[propertyId] = {
+            coords = vector3(coords.x or coords[1] or 0.0, coords.y or coords[2] or 0.0, coords.z or coords[3] or 0.0),
+            label = garageData.label or ("House " .. propertyId .. " Garage"),
+            spawnPoint = garageData.spawnPoint or garageData.takeVehicle or {
+                x = coords.x or coords[1] or 0.0,
+                y = coords.y or coords[2] or 0.0,
+                z = coords.z or coords[3] or 0.0,
+                w = coords.w or coords[4] or coords.h or 0.0
+            },
+            propertyId = propertyId
+        }
+    end
+end)
+
+-- Event for ps-housing to open house garage (when E is pressed)
+RegisterNetEvent('dw-garages:client:OpenHouseGarage', function(propertyId, garageData)
+    if not propertyId or not garageData then return end
+    
+    -- Store house garage data for parking detection (if not already stored)
+    local coords = garageData.coords or garageData.spawnPoint or garageData.takeVehicle
+    if coords then
+        houseGaragesData[propertyId] = {
+            coords = vector3(coords.x or coords[1] or 0.0, coords.y or coords[2] or 0.0, coords.z or coords[3] or 0.0),
+            label = garageData.label or ("House " .. propertyId .. " Garage"),
+            spawnPoint = garageData.spawnPoint or garageData.takeVehicle or {
+                x = coords.x or coords[1] or 0.0,
+                y = coords.y or coords[2] or 0.0,
+                z = coords.z or coords[3] or 0.0,
+                w = coords.w or coords[4] or coords.h or 0.0
+            },
+            propertyId = propertyId
+        }
+    end
+    
+    -- Create garage info structure
+    local garageInfo = {
+        label = garageData.label or ("House " .. propertyId .. " Garage"),
+        coords = garageData.coords or {x = 0.0, y = 0.0, z = 0.0},
+        spawnPoint = garageData.spawnPoint or garageData.takeVehicle or {
+            x = garageData.coords and garageData.coords.x or 0.0,
+            y = garageData.coords and garageData.coords.y or 0.0,
+            z = garageData.coords and garageData.coords.z or 0.0,
+            w = garageData.coords and garageData.coords.w or garageData.coords and garageData.coords.h or 0.0
+        },
+        spawnPoints = garageData.spawnPoints or nil
+    }
+    
+    -- If spawnPoints is not provided, create a single spawn point from spawnPoint
+    if not garageInfo.spawnPoints then
+        garageInfo.spawnPoints = {garageInfo.spawnPoint}
+    end
+    
+    -- Trigger the OpenGarage event with house type
+    TriggerEvent('dw-garages:client:OpenGarage', {
+        garageId = propertyId,
+        garageType = "house",
+        garageInfo = garageInfo
+    })
+end)
+
+-- Event to remove house garage data when leaving zone
+RegisterNetEvent('dw-garages:client:RemoveHouseGarage', function(propertyId)
+    if propertyId then
+        houseGaragesData[propertyId] = nil
     end
 end)
 
@@ -2097,6 +2405,16 @@ RegisterNUICallback('takeOutVehicle', function(data, cb)
             garageInfo = Config.GangGarages[currentGarage.id]
         elseif currentGarage.type == "shared" then
             garageInfo = sharedGaragesData[currentGarage.id]
+        elseif currentGarage.type == "house" then
+            garageInfo = houseGaragesData[currentGarage.id]
+            if garageInfo then
+                -- Convert to expected format
+                garageInfo = {
+                    coords = garageInfo.coords or {x = 0.0, y = 0.0, z = 0.0},
+                    spawnPoint = garageInfo.spawnPoint or {x = 0.0, y = 0.0, z = 0.0, w = 0.0},
+                    spawnPoints = garageInfo.spawnPoints or {garageInfo.spawnPoint or {x = 0.0, y = 0.0, z = 0.0, w = 0.0}}
+                }
+            end
         end
         
         local spawnPoints = nil
@@ -2128,7 +2446,7 @@ RegisterNUICallback('takeOutVehicle', function(data, cb)
         
         local spawnCoords = vector3(clearPoint.x, clearPoint.y, clearPoint.z)
         
-        if currentGarage.type == "public" or currentGarage.type == "gang" then
+        if currentGarage.type == "public" or currentGarage.type == "gang" or currentGarage.type == "house" then
             QBCore.Functions.TriggerCallback('dw-garages:server:GetVehicleProperties', function(properties)
                 if properties then
                     QBCore.Functions.SpawnVehicle(model, function(veh)
@@ -2142,7 +2460,9 @@ RegisterNUICallback('takeOutVehicle', function(data, cb)
                         SetEntityAsMissionEntity(veh, true, true)
                         SetEntityCanBeDamaged(veh, true)
                         SetEntityInvincible(veh, false)
-                        SetNetworkIdCanMigrate(NetworkGetNetworkIdFromEntity(veh), false)
+                        if NetworkGetEntityIsNetworked(veh) then
+                            SetNetworkIdCanMigrate(NetworkGetNetworkIdFromEntity(veh), false)
+                        end
                         
                         SetEntityHeading(veh, clearPoint.w)
                         SetVehicleFuelLevel(veh, data.fuel)
@@ -2189,7 +2509,9 @@ RegisterNUICallback('takeOutVehicle', function(data, cb)
                         TriggerEvent("vehiclekeys:client:SetOwner", plate)
                         
                         -- Keep vehicle in world - don't let framework delete on disconnect
-                        SetNetworkIdCanMigrate(NetworkGetNetworkIdFromEntity(veh), false)
+                        if NetworkGetEntityIsNetworked(veh) then
+                            SetNetworkIdCanMigrate(NetworkGetNetworkIdFromEntity(veh), false)
+                        end
                         
                         QBCore.Functions.Notify("Vehicle taken out", "success")
                         cb({status = "success"})
@@ -2210,7 +2532,9 @@ RegisterNUICallback('takeOutVehicle', function(data, cb)
                 SetEntityAsMissionEntity(veh, true, true)
                 SetEntityCanBeDamaged(veh, true)
                 SetEntityInvincible(veh, false)
-                SetNetworkIdCanMigrate(NetworkGetNetworkIdFromEntity(veh), false)
+                if NetworkGetEntityIsNetworked(veh) then
+                    SetNetworkIdCanMigrate(NetworkGetNetworkIdFromEntity(veh), false)
+                end
                 
                 SetEntityHeading(veh, clearPoint.w)
                 SetVehicleFuelLevel(veh, data.fuel)
@@ -2252,9 +2576,12 @@ RegisterNUICallback('takeOutVehicle', function(data, cb)
         local plate = QBCore.Functions.GetPlate(veh)
         if plate then
             TriggerServerEvent('dw-garages:server:UpdateVehicleState', plate, 0)
+                        
+                        -- Give keys to player for owned vehicles in job garages
+                        TriggerEvent("vehiclekeys:client:SetOwner", plate)
         end
         
-        QBCore.Functions.Notify("Job vehicle taken out", "success")
+                    QBCore.Functions.Notify("Vehicle taken out", "success")
         cb({status = "success"})
                 end, plate)
             end, spawnCoords, true)
@@ -2308,7 +2635,9 @@ RegisterNetEvent('dw-garages:client:TakeOutSharedVehicle', function(plate, vehic
         SetEntityAsMissionEntity(veh, true, true)
         SetEntityCanBeDamaged(veh, true)
         SetEntityInvincible(veh, false)
-        SetNetworkIdCanMigrate(NetworkGetNetworkIdFromEntity(veh), false)
+        if NetworkGetEntityIsNetworked(veh) then
+            SetNetworkIdCanMigrate(NetworkGetNetworkIdFromEntity(veh), false)
+        end
         
         SetEntityHeading(veh, clearPoint.w)
         SetVehicleFuelLevel(veh, vehicleData.fuel)
@@ -2564,8 +2893,8 @@ function PlayVehicleTransferAnimation(plate, fromGarageId, toGarageId)
                 TaskVehicleDriveToCoord(driver, truck, exitX, exitY, exitZ, speed, 0, GetHashKey(truckModel), vehicleFlags, 2.0, true)
                 
                 Wait(5000)
-                
-                Wait(50)
+                    
+                    Wait(50) 
             end
             
             RemoveBlip(blip)
@@ -2601,12 +2930,29 @@ RegisterNUICallback('directTransferVehicle', function(data, cb)
     
     cb({status = "success"})
     
+    -- Reset transfer states before starting new transfer
+    isTransferringVehicle = false
+    transferAnimationActive = false
+    currentTransferVehicle = nil
+    
     if Config.EnableTransferAnimation then
         local fromGarageId = currentGarage.id
         PlayVehicleTransferAnimation(plate, fromGarageId, newGarageId)
     else
         TriggerServerEvent('dw-garages:server:TransferVehicleToGarage', plate, newGarageId, cost)
     end
+    
+    -- Fallback timeout to ensure modal closes if transfer fails silently
+    Citizen.SetTimeout(15000, function()
+        -- Force close modal if still open
+        SendNUIMessage({
+            action = "closeTransferModal"
+        })
+        -- Reset states
+        isTransferringVehicle = false
+        transferAnimationActive = false
+        currentTransferVehicle = nil
+    end)
     
     Citizen.SetTimeout(1000, function()
         TriggerEvent('dw-garages:client:RefreshVehicleList')
@@ -2621,6 +2967,10 @@ RegisterNUICallback('transferVehicle', function(data, cb)
     
     if not plate or not newGarageId then
         cb({status = "error", message = "Invalid data"})
+        -- Close modal on error
+        SendNUIMessage({
+            action = "closeTransferModal"
+        })
         return
     end
     
@@ -2632,12 +2982,24 @@ RegisterNUICallback('transferVehicle', function(data, cb)
     isTransferringVehicle = true
     currentTransferVehicle = {plate = plate, garage = newGarageId}
     
-    SetNuiFocus(false, false)
+    -- Don't close NUI focus, keep menu open during transfer
     TriggerServerEvent('dw-garages:server:TransferVehicleToGarage', plate, newGarageId, cost)
     
-    Citizen.SetTimeout(2000, function()
-        isTransferringVehicle = false
-        currentTransferVehicle = nil
+    -- Fallback timeout to reset state and close modal if server doesn't respond
+    Citizen.SetTimeout(15000, function()
+        if isTransferringVehicle then
+            isTransferringVehicle = false
+            transferAnimationActive = false
+            currentTransferVehicle = nil
+            -- Force close modal if stuck
+            SendNUIMessage({
+                action = "closeTransferModal"
+            })
+            -- Restore NUI focus if menu is still open
+            if currentGarage and isMenuOpen then
+                SetNuiFocus(true, true)
+            end
+        end
     end)
     cb({status = "success"})
 end)
@@ -2732,7 +3094,34 @@ end)
 RegisterNetEvent('dw-garages:client:TransferComplete', function(newGarageId, plate)
     QBCore.Functions.Notify("Vehicle transferred to " .. newGarageId .. " garage", "success")
     
+    -- Reset transfer states immediately
+    isTransferringVehicle = false
+    transferAnimationActive = false
+    currentTransferVehicle = nil
+    
+    -- Close transfer modal if open (send multiple times to ensure it closes)
+    SendNUIMessage({
+        action = "closeTransferModal"
+    })
+    
+    -- Send again after a small delay to ensure it closes
+    Citizen.SetTimeout(100, function()
+        SendNUIMessage({
+            action = "closeTransferModal"
+        })
+    end)
+    
+    -- Send one more time after a longer delay as final safety check
+    Citizen.SetTimeout(500, function()
+        SendNUIMessage({
+            action = "closeTransferModal"
+        })
+    end)
+    
+    -- Ensure NUI focus is restored if menu is still open
     if currentGarage and isMenuOpen then
+        SetNuiFocus(true, true)
+        local garageId = currentGarage.id
         QBCore.Functions.TriggerCallback('dw-garages:server:GetPersonalVehicles', function(vehicles)
             if vehicles then
                 SendNUIMessage({
@@ -2740,7 +3129,7 @@ RegisterNetEvent('dw-garages:client:TransferComplete', function(newGarageId, pla
                     vehicles = FormatVehiclesForNUI(vehicles)
                 })
             end
-        end)
+        end, garageId)
     end
 end)
 
@@ -2906,6 +3295,18 @@ RegisterNetEvent('dw-garages:client:StoreVehicle', function(data)
             end
         end
         
+        -- Check house garages
+        for propertyId, garageData in pairs(houseGaragesData) do
+            if garageData.coords then
+                local dist = #(pos - garageData.coords)
+                if dist < closestDist and dist < 10.0 then
+                    closestDist = dist
+                    closestGarage = propertyId
+                    closestType = "house"
+                end
+            end
+        end
+        
         garageId = closestGarage
         garageType = closestType
         
@@ -2925,6 +3326,16 @@ RegisterNetEvent('dw-garages:client:StoreVehicle', function(data)
         garageInfo = Config.JobGarages[garageId]
     elseif garageType == "gang" then
         garageInfo = Config.GangGarages[garageId]
+    elseif garageType == "house" then
+        garageInfo = houseGaragesData[garageId]
+        if garageInfo then
+            -- Convert to expected format
+            garageInfo = {
+                coords = garageInfo.coords or {x = 0.0, y = 0.0, z = 0.0},
+                spawnPoint = garageInfo.spawnPoint or {x = 0.0, y = 0.0, z = 0.0, w = 0.0},
+                spawnPoints = garageInfo.spawnPoints or {garageInfo.spawnPoint or {x = 0.0, y = 0.0, z = 0.0, w = 0.0}}
+            }
+        end
     end
     
     if not garageInfo then
@@ -2932,7 +3343,22 @@ RegisterNetEvent('dw-garages:client:StoreVehicle', function(data)
         return
     end
     
-    local garageCoords = vector3(garageInfo.coords.x, garageInfo.coords.y, garageInfo.coords.z)
+    local garageCoords = nil
+    if garageInfo.coords then
+        if type(garageInfo.coords) == "vector3" then
+            garageCoords = garageInfo.coords
+        else
+            garageCoords = vector3(garageInfo.coords.x, garageInfo.coords.y, garageInfo.coords.z)
+        end
+    else
+        -- Fallback for house garages
+        if garageType == "house" and houseGaragesData[garageId] then
+            garageCoords = houseGaragesData[garageId].coords
+        else
+            QBCore.Functions.Notify("Invalid garage coordinates", "error")
+            return
+        end
+    end
     
     local curVeh = GetVehiclePedIsIn(ped, false)
     
@@ -2975,14 +3401,25 @@ RegisterNetEvent('dw-garages:client:StoreVehicle', function(data)
                 QBCore.Functions.Notify("Vehicle stored in garage", "success")
                 
                 if isMenuOpen then
-                    QBCore.Functions.TriggerCallback('dw-garages:server:GetPersonalVehicles', function(vehicles)
-                        if vehicles then
-                            SendNUIMessage({
-                                action = "refreshVehicles",
-                                vehicles = FormatVehiclesForNUI(vehicles)
-                            })
-                        end
-                    end, garageId)
+                    if garageType == "house" then
+                        QBCore.Functions.TriggerCallback('dw-garages:server:GetHouseGarageVehicles', function(vehicles)
+                            if vehicles then
+                                SendNUIMessage({
+                                    action = "refreshVehicles",
+                                    vehicles = FormatVehiclesForNUI(vehicles)
+                                })
+                            end
+                        end, garageId)
+                    else
+                        QBCore.Functions.TriggerCallback('dw-garages:server:GetPersonalVehicles', function(vehicles)
+                            if vehicles then
+                                SendNUIMessage({
+                                    action = "refreshVehicles",
+                                    vehicles = FormatVehiclesForNUI(vehicles)
+                                })
+                            end
+                        end, garageId)
+                    end
                 end
             end)
         else
@@ -3246,6 +3683,35 @@ RegisterNetEvent('dw-garages:client:RefreshVehicleList', function()
 end)
 
 RegisterNetEvent('dw-garages:client:VehicleTransferCompleted', function(successful, plate)
+    -- Always reset transfer states regardless of success
+    isTransferringVehicle = false
+    transferAnimationActive = false
+    currentTransferVehicle = nil
+    
+    -- Close transfer modal if open (send multiple times to ensure it closes)
+    SendNUIMessage({
+        action = "closeTransferModal"
+    })
+    
+    -- Send again after a small delay to ensure it closes
+    Citizen.SetTimeout(100, function()
+        SendNUIMessage({
+            action = "closeTransferModal"
+        })
+    end)
+    
+    -- Send one more time after a longer delay as final safety check
+    Citizen.SetTimeout(500, function()
+        SendNUIMessage({
+            action = "closeTransferModal"
+        })
+    end)
+
+    -- Ensure the garage UI remains interactive (covers shared remove flow too)
+    if currentGarage and isMenuOpen then
+        SetNuiFocus(true, true)
+    end
+    
     if successful then
         if currentGarage and isMenuOpen then
             local garageId = currentGarage.id
@@ -3270,6 +3736,11 @@ RegisterNetEvent('dw-garages:client:VehicleTransferCompleted', function(successf
                     end
                 end, garageId)
             end
+        end
+    else
+        -- Transfer failed - ensure NUI focus is restored if menu is still open
+        if currentGarage and isMenuOpen then
+            SetNuiFocus(true, true)
         end
     end
 end)
@@ -3333,12 +3804,17 @@ function GetVehicleHoverInfo(vehicle)
         vehicleInfo = info
     end, plate)
     
+    local netId = nil
+    if NetworkGetEntityIsNetworked(vehicle) then
+        netId = NetworkGetNetworkIdFromEntity(vehicle)
+    end
+    
     local info = {
         plate = plate,
         model = displayName,
         make = make,
         class = className,
-        netId = NetworkGetNetworkIdFromEntity(vehicle),
+        netId = netId,
         inVehicle = inVehicle,
         fuel = fuelLevel,
         engine = engineHealth / 10,
@@ -3650,17 +4126,47 @@ RegisterCommand('impound', function(source, args)
             TriggerServerEvent('dw-garages:server:ImpoundVehicleWithParams', plate, props, reason, impoundType, 
                 PlayerData.job.name, PlayerData.charinfo.firstname .. " " .. PlayerData.charinfo.lastname, impoundFine)
             
-            -- Remove mission entity status before deleting
-            if DoesEntityExist(vehicle) and IsEntityAMissionEntity(vehicle) then
-                SetEntityAsMissionEntity(vehicle, false, true)
+            -- Try to delete vehicle immediately (server will also trigger deletion as backup)
+            if DoesEntityExist(vehicle) then
+                -- Remove mission entity status before deleting
+                if IsEntityAMissionEntity(vehicle) then
+                    SetEntityAsMissionEntity(vehicle, false, true)
+                end
+                local netId = nil
+                if NetworkGetEntityIsNetworked(vehicle) then
+                    netId = NetworkGetNetworkIdFromEntity(vehicle)
+                    if netId then
+                        SetNetworkIdCanMigrate(netId, true)
+                    end
+                end
+                FadeOutVehicle(vehicle, function()
+                    QBCore.Functions.Notify("Vehicle impounded with $" .. impoundFine .. " fine", "success")
+                end)
+            else
+                -- Vehicle reference is stale, find it by plate
+                local vehicles = GetGamePool('CVehicle')
+                for i = 1, #vehicles do
+                    local veh = vehicles[i]
+                    if DoesEntityExist(veh) then
+                        local vehPlate = QBCore.Functions.GetPlate(veh)
+                        if vehPlate and vehPlate:gsub("%s+", "") == plate:gsub("%s+", "") then
+                            if IsEntityAMissionEntity(veh) then
+                                SetEntityAsMissionEntity(veh, false, true)
+                            end
+                            local netId = nil
+                            if NetworkGetEntityIsNetworked(veh) then
+                                netId = NetworkGetNetworkIdFromEntity(veh)
+                                if netId then
+                                    SetNetworkIdCanMigrate(netId, true)
+                                end
+                            end
+                            DeleteEntity(veh)
+                            QBCore.Functions.Notify("Vehicle impounded with $" .. impoundFine .. " fine", "success")
+                            break
+                        end
+                    end
+                end
             end
-            local netId = NetworkGetNetworkIdFromEntity(vehicle)
-            if netId then
-                SetNetworkIdCanMigrate(netId, true)
-            end
-            FadeOutVehicle(vehicle, function()
-                QBCore.Functions.Notify("Vehicle impounded with $" .. impoundFine .. " fine", "success")
-            end)
         end, function() 
             ClearPedTasks(ped)
             QBCore.Functions.Notify("Impound cancelled", "error")
@@ -3769,7 +4275,9 @@ RegisterNUICallback('releaseImpoundedVehicle', function(data, cb)
                                 SetEntityAsMissionEntity(veh, true, true)
                                 SetEntityCanBeDamaged(veh, true)
                                 SetEntityInvincible(veh, false)
-                                SetNetworkIdCanMigrate(NetworkGetNetworkIdFromEntity(veh), false)
+                                if NetworkGetEntityIsNetworked(veh) then
+                                    SetNetworkIdCanMigrate(NetworkGetNetworkIdFromEntity(veh), false)
+                                end
                                 
                                 SetEntityHeading(veh, spawnPoint.w)
                                 SetEntityCoords(veh, spawnPoint.x, spawnPoint.y, spawnPoint.z)
@@ -3939,21 +4447,86 @@ AddEventHandler('dw-garages:client:ImpoundVehicle', function()
             
             TriggerServerEvent('dw-garages:server:ImpoundVehicle', plate, props, reason, impoundType, PlayerData.job.name, PlayerData.charinfo.firstname .. " " .. PlayerData.charinfo.lastname)
             
-            -- Remove mission entity status before deleting
-            if DoesEntityExist(vehicle) and IsEntityAMissionEntity(vehicle) then
-                SetEntityAsMissionEntity(vehicle, false, true)
+            -- Try to delete vehicle immediately (server will also trigger deletion as backup)
+            if DoesEntityExist(vehicle) then
+                -- Remove mission entity status before deleting
+                if IsEntityAMissionEntity(vehicle) then
+                    SetEntityAsMissionEntity(vehicle, false, true)
+                end
+                local netId = nil
+                if NetworkGetEntityIsNetworked(vehicle) then
+                    netId = NetworkGetNetworkIdFromEntity(vehicle)
+                    if netId then
+                        SetNetworkIdCanMigrate(netId, true)
+                    end
+                end
+                FadeOutVehicle(vehicle, function()
+                    QBCore.Functions.Notify("Vehicle impounded successfully", "success")
+                end)
+            else
+                -- Vehicle reference is stale, find it by plate
+                local vehicles = GetGamePool('CVehicle')
+                for i = 1, #vehicles do
+                    local veh = vehicles[i]
+                    if DoesEntityExist(veh) then
+                        local vehPlate = QBCore.Functions.GetPlate(veh)
+                        if vehPlate and vehPlate:gsub("%s+", "") == plate:gsub("%s+", "") then
+                            if IsEntityAMissionEntity(veh) then
+                                SetEntityAsMissionEntity(veh, false, true)
+                            end
+                            local netId = nil
+                            if NetworkGetEntityIsNetworked(veh) then
+                                netId = NetworkGetNetworkIdFromEntity(veh)
+                                if netId then
+                                    SetNetworkIdCanMigrate(netId, true)
+                                end
+                            end
+                            DeleteEntity(veh)
+                            QBCore.Functions.Notify("Vehicle impounded successfully", "success")
+                            break
+                        end
+                    end
+                end
             end
-            local netId = NetworkGetNetworkIdFromEntity(vehicle)
-            if netId then
-                SetNetworkIdCanMigrate(netId, true)
-            end
-            FadeOutVehicle(vehicle, function()
-                QBCore.Functions.Notify("Vehicle impounded successfully", "success")
-            end)
         end, function() 
             ClearPedTasks(ped)
             QBCore.Functions.Notify("Impound cancelled", "error")
         end)
+    end
+end)
+
+-- Event to delete impounded vehicle by plate (called from server after successful impound)
+RegisterNetEvent('dw-garages:client:DeleteImpoundedVehicle', function(plate)
+    if not plate then return end
+    
+    plate = plate:gsub("%s+", "")
+    
+    -- Find vehicle by plate
+    local vehicles = GetGamePool('CVehicle')
+    for i = 1, #vehicles do
+        local vehicle = vehicles[i]
+        if DoesEntityExist(vehicle) then
+            local vehiclePlate = QBCore.Functions.GetPlate(vehicle)
+            if vehiclePlate and vehiclePlate:gsub("%s+", "") == plate then
+                -- Remove mission entity status before deleting
+                if IsEntityAMissionEntity(vehicle) then
+                    SetEntityAsMissionEntity(vehicle, false, true)
+                end
+                
+                -- Allow network migration temporarily for deletion
+                local netId = nil
+                if NetworkGetEntityIsNetworked(vehicle) then
+                    netId = NetworkGetNetworkIdFromEntity(vehicle)
+                    if netId then
+                        SetNetworkIdCanMigrate(netId, true)
+                    end
+                end
+                
+                -- Delete the vehicle
+                DeleteEntity(vehicle)
+                break
+            end
+        end
     end
 end)
 
@@ -3962,3 +4535,38 @@ RegisterNUICallback('closeImpound', function(data, cb)
     cb({status = "success"})
 end)
 
+-- Track player's current vehicle for crash/disconnect handling
+CreateThread(function()
+    local lastVehiclePlate = nil
+    
+    while true do
+        Wait(5000) -- Check every 5 seconds
+        
+        if isPlayerLoaded then
+            local ped = PlayerPedId()
+            local isInVehicle = IsPedInAnyVehicle(ped, false)
+            
+            if isInVehicle then
+                local vehicle = GetVehiclePedIsIn(ped, false)
+                if DoesEntityExist(vehicle) then
+                    local plate = QBCore.Functions.GetPlate(vehicle)
+                    if plate then
+                        plate = plate:gsub("%s+", "") -- Remove spaces
+                        
+                        -- Only send update if plate changed
+                        if plate ~= lastVehiclePlate then
+                            lastVehiclePlate = plate
+                            TriggerServerEvent('dw-garages:server:UpdatePlayerVehicle', plate)
+                        end
+                    end
+                end
+            else
+                -- Player is not in a vehicle, clear tracking
+                if lastVehiclePlate then
+                    lastVehiclePlate = nil
+                    TriggerServerEvent('dw-garages:server:UpdatePlayerVehicle', nil)
+                end
+            end
+        end
+    end
+end)

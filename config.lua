@@ -13,7 +13,7 @@ Config.ImpoundFee = 500  -- Base fee to retrieve a vehicle from impound
 Config.AdditionalDayFee = 250  -- Additional fee per day in impound
 Config.MaxFeeMultiplier = 5  -- Maximum multiplier for fees
 Config.ShowJobVehiclesTab = true -- Show Job Vehicles tab in garage
-Config.LostVehicleTimeout = 7200 -- Time in seconds before an out vehicle is considered lost (2 hours)
+Config.LostVehicleTimeout = 10800 -- Time in seconds before an out vehicle is considered lost (3 hours)
 Config.ImpoundJobs = {
     ['police'] = true,
     ['sheriff'] = true,
@@ -189,12 +189,12 @@ Config.JobGarages = {
             }
         }
     },
-    ['mechanic'] = {
+    ['yokai'] = {
         label = 'Mechanic Garage',
-        coords = vector4(-344.94, -124.4, 39.01, 339.54),
+        coords = vector4(-351.63, -108.32, 38.7, 162.0),
         type = 'job',
-        job = 'mechanic',
-        spawnPoint = vector4(-350.85, -136.39, 39.01, 70.29),
+        job = 'yokai',
+        spawnPoint = vector4(-355.79, -110.95, 37.7, 76.23),
         -- Transfer animation points
         transferSpawn = vector4(-362.3, -140.8, 38.7, 120.0),
         transferArrival = vector4(-347.5, -129.2, 39.0, 340.0),
